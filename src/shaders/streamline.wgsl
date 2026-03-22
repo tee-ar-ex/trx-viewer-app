@@ -1,5 +1,8 @@
 struct Uniforms {
     view_proj: mat4x4<f32>,
+    slab_axis: u32,
+    slab_min: f32,
+    slab_max: f32,
 }
 
 @group(0) @binding(0) var<uniform> uniforms: Uniforms;
@@ -12,6 +15,7 @@ struct VertexInput {
 struct VertexOutput {
     @builtin(position) clip_position: vec4<f32>,
     @location(0) color: vec4<f32>,
+    @location(1) world_pos: vec3<f32>,
 }
 
 @vertex
@@ -19,10 +23,25 @@ fn vs_main(in: VertexInput) -> VertexOutput {
     var out: VertexOutput;
     out.clip_position = uniforms.view_proj * vec4<f32>(in.position, 1.0);
     out.color = in.color;
+    out.world_pos = in.position;
     return out;
 }
 
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+    // Slab clipping: discard fragments outside the slab range
+    if uniforms.slab_axis < 3u {
+        var coord: f32;
+        if uniforms.slab_axis == 0u {
+            coord = in.world_pos.x;
+        } else if uniforms.slab_axis == 1u {
+            coord = in.world_pos.y;
+        } else {
+            coord = in.world_pos.z;
+        }
+        if coord < uniforms.slab_min || coord > uniforms.slab_max {
+            discard;
+        }
+    }
     return in.color;
 }

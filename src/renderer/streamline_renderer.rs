@@ -5,11 +5,15 @@ use crate::data::trx_data::TrxGpuData;
 /// GPU resources for streamline rendering.
 pub struct StreamlineResources {
     pub pipeline: wgpu::RenderPipeline,
+    /// Pipeline for slice views (depth test Always, so streamlines aren't hidden behind NIfTI quad).
+    pub slice_pipeline: wgpu::RenderPipeline,
     pub position_buffer: wgpu::Buffer,
     pub color_buffer: wgpu::Buffer,
     pub index_buffer: wgpu::Buffer,
-    pub uniform_buffer: wgpu::Buffer,
-    pub bind_group: wgpu::BindGroup,
+    /// Per-viewport uniform buffers: [3D, axial, coronal, sagittal].
+    pub uniform_buffers: [wgpu::Buffer; 4],
+    /// Per-viewport bind groups.
+    pub bind_groups: [wgpu::BindGroup; 4],
     pub num_indices: u32,
 }
 
@@ -17,6 +21,11 @@ pub struct StreamlineResources {
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 struct Uniforms {
     view_proj: [[f32; 4]; 4],
+    /// Slab clipping axis: 0=X, 1=Y, 2=Z, 3=disabled.
+    slab_axis: u32,
+    slab_min: f32,
+    slab_max: f32,
+    _pad: u32,
 }
 
 impl StreamlineResources {
@@ -32,20 +41,11 @@ impl StreamlineResources {
             ),
         });
 
-        let uniforms = Uniforms {
-            view_proj: glam::Mat4::IDENTITY.to_cols_array_2d(),
-        };
-        let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("streamline_uniforms"),
-            contents: bytemuck::bytes_of(&uniforms),
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        });
-
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("streamline_bind_group_layout"),
             entries: &[wgpu::BindGroupLayoutEntry {
                 binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX,
+                visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
                 ty: wgpu::BindingType::Buffer {
                     ty: wgpu::BufferBindingType::Uniform,
                     has_dynamic_offset: false,
@@ -55,13 +55,32 @@ impl StreamlineResources {
             }],
         });
 
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("streamline_bind_group"),
-            layout: &bind_group_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: uniform_buffer.as_entire_binding(),
-            }],
+        // Create 4 uniform buffers and bind groups (3D + 3 slice viewports)
+        let default_uniforms = Uniforms {
+            view_proj: glam::Mat4::IDENTITY.to_cols_array_2d(),
+            slab_axis: 3, // disabled
+            slab_min: 0.0,
+            slab_max: 0.0,
+            _pad: 0,
+        };
+
+        let uniform_buffers: [wgpu::Buffer; 4] = std::array::from_fn(|i| {
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some(&format!("streamline_uniforms_{i}")),
+                contents: bytemuck::bytes_of(&default_uniforms),
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            })
+        });
+
+        let bind_groups: [wgpu::BindGroup; 4] = std::array::from_fn(|i| {
+            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some(&format!("streamline_bind_group_{i}")),
+                layout: &bind_group_layout,
+                entries: &[wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: uniform_buffers[i].as_entire_binding(),
+                }],
+            })
         });
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -131,6 +150,62 @@ impl StreamlineResources {
             cache: None,
         });
 
+        // Slice view pipeline: depth test Always so streamlines aren't hidden behind NIfTI quad
+        let slice_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("streamline_slice_pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                buffers: &[
+                    wgpu::VertexBufferLayout {
+                        array_stride: 12,
+                        step_mode: wgpu::VertexStepMode::Vertex,
+                        attributes: &[wgpu::VertexAttribute {
+                            offset: 0,
+                            shader_location: 0,
+                            format: wgpu::VertexFormat::Float32x3,
+                        }],
+                    },
+                    wgpu::VertexBufferLayout {
+                        array_stride: 16,
+                        step_mode: wgpu::VertexStepMode::Vertex,
+                        attributes: &[wgpu::VertexAttribute {
+                            offset: 0,
+                            shader_location: 1,
+                            format: wgpu::VertexFormat::Float32x4,
+                        }],
+                    },
+                ],
+                compilation_options: Default::default(),
+            },
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::LineList,
+                cull_mode: None,
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: false,
+                depth_compare: wgpu::CompareFunction::Always,
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: target_format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            multiview: None,
+            cache: None,
+        });
+
         let position_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("streamline_positions"),
             contents: bytemuck::cast_slice(&data.positions),
@@ -151,20 +226,36 @@ impl StreamlineResources {
 
         Self {
             pipeline,
+            slice_pipeline,
             position_buffer,
             color_buffer,
             index_buffer,
-            uniform_buffer,
-            bind_group,
+            uniform_buffers,
+            bind_groups,
             num_indices: data.all_indices.len() as u32,
         }
     }
 
-    pub fn update_uniforms(&self, queue: &wgpu::Queue, view_proj: glam::Mat4) {
+    /// Update uniforms for a specific viewport.
+    /// `viewport`: 0=3D, 1=axial, 2=coronal, 3=sagittal.
+    /// `slab_axis`: 0=X, 1=Y, 2=Z, 3=disabled.
+    pub fn update_uniforms(
+        &self,
+        queue: &wgpu::Queue,
+        viewport: usize,
+        view_proj: glam::Mat4,
+        slab_axis: u32,
+        slab_min: f32,
+        slab_max: f32,
+    ) {
         let uniforms = Uniforms {
             view_proj: view_proj.to_cols_array_2d(),
+            slab_axis,
+            slab_min,
+            slab_max,
+            _pad: 0,
         };
-        queue.write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
+        queue.write_buffer(&self.uniform_buffers[viewport], 0, bytemuck::bytes_of(&uniforms));
     }
 
     /// Re-upload only the color buffer.

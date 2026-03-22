@@ -67,26 +67,38 @@ impl OrbitCamera {
 }
 
 /// Orthographic camera for 2D slice views.
+///
+/// Uses a rotation angle to orient the view according to neuroimaging conventions.
+/// center[0] corresponds to the screen-horizontal axis, center[1] to screen-vertical.
 pub struct OrthoSliceCamera {
     pub axis: SliceAxis,
-    /// Center of view in RAS+ space (the 2 in-plane coordinates).
+    /// Center of view in screen space: [horizontal, vertical].
     pub center: [f32; 2],
     /// Half-extent of the view (zoom level).
     pub half_extent: f32,
+    /// In-plane rotation angle (radians, positive = CCW from viewer's perspective).
+    pub rotation: f32,
 }
 
 impl OrthoSliceCamera {
     pub fn new(axis: SliceAxis, volume_center: Vec3, volume_extent: f32) -> Self {
-        // Extract the 2 in-plane coordinates of the volume center
-        let center = match axis {
-            SliceAxis::Axial => [volume_center.x, volume_center.y],
-            SliceAxis::Coronal => [volume_center.x, volume_center.z],
-            SliceAxis::Sagittal => [volume_center.y, volume_center.z],
+        // Rotation angles to match standard neuroimaging conventions:
+        //   Axial:    90° CW  = -π/2
+        //   Coronal:  90° CCW = +π/2
+        //   Sagittal: 90° CW  = -π/2
+        let (center, rotation) = match axis {
+            // Axial: looking down -Z, screen-right = +X (right), screen-up = +Y (anterior)
+            SliceAxis::Axial => ([volume_center.x, volume_center.y], 0.0f32),
+            // Coronal: looking along -Y, screen-right = -X (radiological), screen-up = +Z (superior)
+            SliceAxis::Coronal => ([volume_center.x, volume_center.z], 0.0f32),
+            // Sagittal: looking along +X, screen-right = -Y (posterior), screen-up = +Z (superior)
+            SliceAxis::Sagittal => ([volume_center.y, volume_center.z], 0.0f32),
         };
         Self {
             axis,
             center,
             half_extent: volume_extent * 0.5,
+            rotation,
         }
     }
 
@@ -128,17 +140,69 @@ impl OrthoSliceCamera {
         };
 
         let view = Mat4::look_at_rh(eye, target, up);
-        projection * view
+
+        // Apply in-plane rotation (around screen Z axis, i.e., the look direction)
+        let rot = Mat4::from_rotation_z(self.rotation);
+        rot * projection * view
     }
 
+    /// Handle drag, accounting for the in-plane rotation.
     pub fn handle_drag(&mut self, delta_x: f32, delta_y: f32, viewport_width: f32) {
         let scale = self.half_extent * 2.0 / viewport_width.max(1.0);
-        self.center[0] -= delta_x * scale;
-        self.center[1] -= delta_y * scale;
+        // Rotate the screen drag deltas into the pre-rotation camera frame
+        let cos_r = self.rotation.cos();
+        let sin_r = self.rotation.sin();
+        let rx = cos_r * delta_x + sin_r * delta_y;
+        let ry = -sin_r * delta_x + cos_r * delta_y;
+        self.center[0] -= rx * scale;
+        self.center[1] -= ry * scale;
     }
 
     pub fn handle_zoom(&mut self, delta: f32) {
         self.half_extent *= 1.0 - delta * 0.1;
         self.half_extent = self.half_extent.max(1.0);
+    }
+
+    /// Convert a screen position to RAS+ world coordinates on the slice plane.
+    pub fn screen_to_world(
+        &self,
+        screen_pos: egui::Pos2,
+        rect: egui::Rect,
+        aspect: f32,
+        slice_position: f32,
+    ) -> Vec3 {
+        // Screen → NDC
+        let ndc_x = (screen_pos.x - rect.left()) / rect.width() * 2.0 - 1.0;
+        let ndc_y = 1.0 - (screen_pos.y - rect.top()) / rect.height() * 2.0; // flip Y
+
+        // Un-rotate NDC back to the pre-rotation camera frame
+        let cos_r = self.rotation.cos();
+        let sin_r = self.rotation.sin();
+        // Inverse of rotation by self.rotation is rotation by -self.rotation
+        let ux = cos_r * ndc_x + sin_r * ndc_y;
+        let uy = -sin_r * ndc_x + cos_r * ndc_y;
+
+        // NDC → in-plane world coordinates.
+        // Sign depends on which world axis maps to screen-right for each view:
+        //   Axial:    right = +X → wx = center[0] + ndc_x * hx
+        //   Coronal:  right = -X → wx = center[0] - ndc_x * hx
+        //   Sagittal: right = -Y → wx = center[0] - ndc_x * hx (center[0] = volume_center.y)
+        let hx = self.half_extent * aspect;
+        let hy = self.half_extent;
+        let wy = self.center[1] + uy * hy;
+        match self.axis {
+            SliceAxis::Axial => {
+                let wx = self.center[0] + ux * hx;
+                Vec3::new(wx, wy, slice_position)
+            }
+            SliceAxis::Coronal => {
+                let wx = self.center[0] - ux * hx;
+                Vec3::new(wx, slice_position, wy)
+            }
+            SliceAxis::Sagittal => {
+                let wx = self.center[0] - ux * hx;
+                Vec3::new(slice_position, wx, wy)
+            }
+        }
     }
 }

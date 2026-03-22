@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::Path;
 
 use bytemuck::Pod;
@@ -45,6 +46,8 @@ pub struct TrxGpuData {
     pub colors: Vec<[f32; 4]>,
     /// Full line-segment index buffer (all streamlines).
     pub all_indices: Vec<u32>,
+    /// Per-streamline axis-aligned bounding boxes: [min_x, min_y, min_z, max_x, max_y, max_z].
+    pub aabbs: Vec<[f32; 6]>,
 }
 
 #[repr(C)]
@@ -110,6 +113,9 @@ impl TrxGpuData {
         // Default: direction-RGB colors
         let colors = compute_direction_colors(&positions, &offsets);
 
+        // Compute per-streamline AABBs for spatial queries
+        let aabbs = build_streamline_aabbs(&positions, &offsets);
+
         Ok(Self {
             positions,
             offsets,
@@ -124,6 +130,7 @@ impl TrxGpuData {
             dps_data,
             colors,
             all_indices,
+            aabbs,
         })
     }
 
@@ -162,31 +169,94 @@ impl TrxGpuData {
             .collect()
     }
 
-    /// Build index buffer for only the visible groups' streamlines.
-    /// If no groups exist, returns all indices.
-    pub fn indices_for_visible_groups(&self, visible: &[bool]) -> Vec<u32> {
-        if self.groups.is_empty() {
-            return self.all_indices.clone();
-        }
-
-        let mut indices = Vec::new();
-        for (i, (_, members)) in self.groups.iter().enumerate() {
-            if i < visible.len() && !visible[i] {
-                continue;
+    /// Build index buffer applying all active filters: group visibility, max count,
+    /// ordering (for random subsetting), and optional sphere query.
+    pub fn build_index_buffer(
+        &self,
+        visible_groups: &[bool],
+        max_count: usize,
+        ordering: &[u32],
+        sphere_indices: Option<&HashSet<u32>>,
+    ) -> Vec<u32> {
+        // Step 1: Collect visible streamline indices
+        let visible_set: Vec<u32> = if self.groups.is_empty() {
+            (0..self.nb_streamlines as u32).collect()
+        } else {
+            let mut v = Vec::new();
+            for (i, (_, members)) in self.groups.iter().enumerate() {
+                if i < visible_groups.len() && !visible_groups[i] {
+                    continue;
+                }
+                v.extend_from_slice(members);
             }
-            for &streamline_idx in members {
-                let si = streamline_idx as usize;
-                if si + 1 < self.offsets.len() {
-                    let start = self.offsets[si] as u32;
-                    let end = self.offsets[si + 1] as u32;
-                    for j in start..end.saturating_sub(1) {
-                        indices.push(j);
-                        indices.push(j + 1);
-                    }
+            v
+        };
+
+        // Step 2: If sphere filter active, intersect
+        let filtered: Vec<u32> = if let Some(sphere) = sphere_indices {
+            visible_set.into_iter().filter(|idx| sphere.contains(idx)).collect()
+        } else {
+            visible_set
+        };
+
+        // Step 3: Apply ordering and max count
+        let selected: Vec<u32> = if ordering.len() == self.nb_streamlines {
+            // Use ordering to pick which streamlines to show (supports random subsetting)
+            let filtered_set: HashSet<u32> = filtered.into_iter().collect();
+            ordering.iter()
+                .copied()
+                .filter(|idx| filtered_set.contains(idx))
+                .take(max_count)
+                .collect()
+        } else {
+            filtered.into_iter().take(max_count).collect()
+        };
+
+        // Step 4: Build line-segment index pairs
+        let mut indices = Vec::with_capacity(selected.len() * 100); // rough estimate
+        for &si in &selected {
+            let s = si as usize;
+            if s + 1 < self.offsets.len() {
+                let start = self.offsets[s] as u32;
+                let end = self.offsets[s + 1] as u32;
+                for j in start..end.saturating_sub(1) {
+                    indices.push(j);
+                    indices.push(j + 1);
                 }
             }
         }
         indices
+    }
+
+    /// Query streamlines intersecting a sphere. Returns matching streamline indices.
+    /// Uses AABB broad phase then per-vertex distance check.
+    pub fn query_sphere(&self, center: Vec3, radius: f32) -> HashSet<u32> {
+        let r2 = radius * radius;
+        let sphere_min = center - Vec3::splat(radius);
+        let sphere_max = center + Vec3::splat(radius);
+        let mut result = HashSet::new();
+
+        for si in 0..self.nb_streamlines {
+            let aabb = &self.aabbs[si];
+            // AABB broad phase
+            if aabb[3] < sphere_min.x || aabb[0] > sphere_max.x
+                || aabb[4] < sphere_min.y || aabb[1] > sphere_max.y
+                || aabb[5] < sphere_min.z || aabb[2] > sphere_max.z
+            {
+                continue;
+            }
+            // Vertex-level narrow phase
+            let start = self.offsets[si] as usize;
+            let end = self.offsets[si + 1] as usize;
+            for vi in start..end {
+                let p = Vec3::from(self.positions[vi]);
+                if (p - center).length_squared() <= r2 {
+                    result.insert(si as u32);
+                    break;
+                }
+            }
+        }
+        result
     }
 
     fn compute_group_colors(&self) -> Vec<[f32; 4]> {
@@ -379,6 +449,27 @@ fn scalar_to_colors(values: &[f32]) -> Vec<[f32; 4]> {
             }
         })
         .collect()
+}
+
+/// Compute per-streamline axis-aligned bounding boxes.
+fn build_streamline_aabbs(positions: &[[f32; 3]], offsets: &[u64]) -> Vec<[f32; 6]> {
+    let nb = offsets.len().saturating_sub(1);
+    let mut aabbs = Vec::with_capacity(nb);
+    for win in offsets.windows(2) {
+        let start = win[0] as usize;
+        let end = win[1] as usize;
+        let mut min = [f32::INFINITY; 3];
+        let mut max = [f32::NEG_INFINITY; 3];
+        for vi in start..end {
+            let p = &positions[vi];
+            for d in 0..3 {
+                min[d] = min[d].min(p[d]);
+                max[d] = max[d].max(p[d]);
+            }
+        }
+        aabbs.push([min[0], min[1], min[2], max[0], max[1], max[2]]);
+    }
+    aabbs
 }
 
 /// Expand per-streamline scalar values to per-vertex colors.
