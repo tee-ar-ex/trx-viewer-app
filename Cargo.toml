@@ -1,0 +1,28 @@
+[package]
+name = "trx-viewer-app"
+version = "0.1.0"
+edition = "2024"
+
+[package.metadata.bundle]
+name = "TRX Viewer"
+identifier = "com.trx-viewer.app"
+icon = ["assets/icon.icns"]
+category = "public.app-category.medical"
+
+[dependencies]
+trx-rs = { path = "../trx-rs" }
+eframe = { version = "0.33", default-features = false, features = ["wgpu", "wayland", "x11", "default_fonts"] }
+egui = "0.33"
+egui-wgpu = "0.33"
+wgpu = "27"
+glam = { version = "0.29", features = ["bytemuck"] }
+bytemuck = { version = "1", features = ["derive"] }
+half = { version = "2", features = ["bytemuck"] }
+log = "0.4"
+env_logger = "0.11"
+anyhow = "1"
+nifti = { version = "0.17", features = ["ndarray_volumes"] }
+ndarray = "0.16"
+rfd = "0.15"
+parking_lot = "0.12"
+image = { version = "0.25", default-features = false, features = ["png"] }
