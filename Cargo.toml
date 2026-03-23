@@ -26,3 +26,6 @@ ndarray = "0.16"
 rfd = "0.15"
 parking_lot = "0.12"
 image = { version = "0.25", default-features = false, features = ["png"] }
+roxmltree = "0.20"
+base64 = "0.22"
+flate2 = "1"

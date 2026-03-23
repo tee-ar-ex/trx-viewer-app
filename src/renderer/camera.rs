@@ -107,10 +107,14 @@ impl OrthoSliceCamera {
     pub fn view_projection(&self, aspect: f32, slice_position: f32) -> Mat4 {
         let hx = self.half_extent * aspect;
         let hy = self.half_extent;
+        // Keep coronal in neurological orientation (R on screen-right), while
+        // axial and sagittal already have the desired left-right orientation.
+        let flip_lr = matches!(self.axis, SliceAxis::Coronal);
+        let (left, right) = if flip_lr { (hx, -hx) } else { (-hx, hx) };
 
         let projection = Mat4::orthographic_rh(
-            -hx,
-            hx,
+            left,
+            right,
             -hy,
             hy,
             -10000.0,
@@ -181,11 +185,10 @@ impl OrthoSliceCamera {
         // Inverse of rotation by self.rotation is rotation by -self.rotation
         let ux = cos_r * ndc_x + sin_r * ndc_y;
         let uy = -sin_r * ndc_x + cos_r * ndc_y;
-
         // NDC → in-plane world coordinates.
         // Sign depends on which world axis maps to screen-right for each view:
         //   Axial:    right = +X → wx = center[0] + ndc_x * hx
-        //   Coronal:  right = -X → wx = center[0] - ndc_x * hx
+        //   Coronal:  projection is flipped, so right = +X → wx = center[0] + ndc_x * hx
         //   Sagittal: right = -Y → wx = center[0] - ndc_x * hx (center[0] = volume_center.y)
         let hx = self.half_extent * aspect;
         let hy = self.half_extent;
@@ -196,7 +199,7 @@ impl OrthoSliceCamera {
                 Vec3::new(wx, wy, slice_position)
             }
             SliceAxis::Coronal => {
-                let wx = self.center[0] - ux * hx;
+                let wx = self.center[0] + ux * hx;
                 Vec3::new(wx, slice_position, wy)
             }
             SliceAxis::Sagittal => {

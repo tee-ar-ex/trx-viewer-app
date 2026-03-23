@@ -3,11 +3,23 @@ use std::path::PathBuf;
 
 use glam::Vec3;
 
+use crate::data::gifti_data::GiftiSurfaceData;
 use crate::data::nifti_data::NiftiVolume;
 use crate::data::trx_data::{ColorMode, TrxGpuData};
 use crate::renderer::camera::{OrbitCamera, OrthoSliceCamera};
+use crate::renderer::mesh_renderer::{MeshDrawStyle, MeshResources};
 use crate::renderer::slice_renderer::{SliceAxis, SliceResources};
 use crate::renderer::streamline_renderer::StreamlineResources;
+
+struct LoadedGiftiSurface {
+    name: String,
+    path: PathBuf,
+    data: GiftiSurfaceData,
+    gpu_index: usize,
+    visible: bool,
+    opacity: f32,
+    color: [f32; 3],
+}
 
 /// Main application state.
 pub struct TrxViewerApp {
@@ -28,6 +40,8 @@ pub struct TrxViewerApp {
     volume_extent: f32,
     /// Error message to display.
     error_msg: Option<String>,
+    /// Loaded GIFTI surfaces.
+    gifti_surfaces: Vec<LoadedGiftiSurface>,
     /// Current coloring mode.
     color_mode: ColorMode,
     /// Whether vertex colors need re-upload.
@@ -80,6 +94,7 @@ impl TrxViewerApp {
             volume_center: Vec3::ZERO,
             volume_extent: 200.0,
             error_msg: None,
+            gifti_surfaces: Vec::new(),
             color_mode: ColorMode::DirectionRgb,
             colors_dirty: false,
             group_visible: Vec::new(),
@@ -195,6 +210,51 @@ impl TrxViewerApp {
         }
     }
 
+    fn load_gifti_surface(&mut self, path: &PathBuf, rs: &egui_wgpu::RenderState) {
+        match GiftiSurfaceData::load(path) {
+            Ok(surface) => {
+                let mut renderer = rs.renderer.write();
+                if renderer.callback_resources.get::<MeshResources>().is_none() {
+                    renderer
+                        .callback_resources
+                        .insert(MeshResources::new(&rs.device, rs.target_format));
+                }
+                let mesh_resources = renderer
+                    .callback_resources
+                    .get_mut::<MeshResources>()
+                    .expect("MeshResources inserted");
+                let gpu_index = mesh_resources.add_surface(&rs.device, &surface);
+
+                let palette: &[[f32; 3]] = &[
+                    [0.94, 0.35, 0.35],
+                    [0.35, 0.8, 0.95],
+                    [0.4, 0.92, 0.45],
+                    [0.98, 0.75, 0.35],
+                    [0.85, 0.45, 0.95],
+                    [0.95, 0.55, 0.2],
+                ];
+                let color = palette[self.gifti_surfaces.len() % palette.len()];
+                let name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "surface.gii".to_string());
+                self.gifti_surfaces.push(LoadedGiftiSurface {
+                    name,
+                    path: path.clone(),
+                    data: surface,
+                    gpu_index,
+                    visible: true,
+                    opacity: 0.7,
+                    color,
+                });
+                self.error_msg = None;
+            }
+            Err(e) => {
+                self.error_msg = Some(format!("Failed to load GIFTI surface: {e}"));
+            }
+        }
+    }
+
     fn reset_slice_cameras(&mut self) {
         let half_extents = self
             .nifti_volume
@@ -306,6 +366,142 @@ impl TrxViewerApp {
             0.0
         }
     }
+
+    fn draw_mesh_intersections(
+        &self,
+        ui: &egui::Ui,
+        rect: egui::Rect,
+        axis_index: usize,
+        view_proj: glam::Mat4,
+        slice_pos: f32,
+    ) {
+        if self.gifti_surfaces.is_empty() {
+            return;
+        }
+        let painter = ui.painter_at(rect);
+        let eps = 1e-4f32;
+
+        let project = |world: glam::Vec3| -> egui::Pos2 {
+            let clip = view_proj * world.extend(1.0);
+            let ndc_x = clip.x / clip.w;
+            let ndc_y = clip.y / clip.w;
+            egui::pos2(
+                rect.left() + (ndc_x + 1.0) * 0.5 * rect.width(),
+                rect.top() + (1.0 - ndc_y) * 0.5 * rect.height(),
+            )
+        };
+
+        for surface in &self.gifti_surfaces {
+            if !surface.visible || surface.opacity <= 0.01 {
+                continue;
+            }
+
+            // Surface-level early out by axis-aligned bounds.
+            let (smin, smax) = match axis_index {
+                0 => (surface.data.bbox_min.z, surface.data.bbox_max.z),
+                1 => (surface.data.bbox_min.y, surface.data.bbox_max.y),
+                _ => (surface.data.bbox_min.x, surface.data.bbox_max.x),
+            };
+            if slice_pos < smin - eps || slice_pos > smax + eps {
+                continue;
+            }
+
+            let color = egui::Color32::from_rgba_unmultiplied(
+                (surface.color[0].clamp(0.0, 1.0) * 255.0) as u8,
+                (surface.color[1].clamp(0.0, 1.0) * 255.0) as u8,
+                (surface.color[2].clamp(0.0, 1.0) * 255.0) as u8,
+                (surface.opacity.clamp(0.0, 1.0) * 255.0) as u8,
+            );
+            let stroke = egui::Stroke::new(1.25, color);
+
+            for tri in surface.data.indices.chunks_exact(3) {
+                let ia = tri[0] as usize;
+                let ib = tri[1] as usize;
+                let ic = tri[2] as usize;
+                let a = glam::Vec3::from(surface.data.vertices[ia]);
+                let b = glam::Vec3::from(surface.data.vertices[ib]);
+                let c = glam::Vec3::from(surface.data.vertices[ic]);
+
+                let tmin = tri_axis_value(a, axis_index)
+                    .min(tri_axis_value(b, axis_index))
+                    .min(tri_axis_value(c, axis_index));
+                let tmax = tri_axis_value(a, axis_index)
+                    .max(tri_axis_value(b, axis_index))
+                    .max(tri_axis_value(c, axis_index));
+                if slice_pos < tmin - eps || slice_pos > tmax + eps {
+                    continue;
+                }
+
+                let mut pts = Vec::with_capacity(3);
+                for (p0, p1) in [(a, b), (b, c), (c, a)] {
+                    if let Some(p) = intersect_edge_with_slice(p0, p1, axis_index, slice_pos, eps) {
+                        if !pts.iter().any(|q: &glam::Vec3| (*q - p).length_squared() <= eps * eps) {
+                            pts.push(p);
+                        }
+                    }
+                }
+                if pts.len() < 2 {
+                    continue;
+                }
+                // For rare 3-point cases (vertex on plane), keep the longest segment.
+                let (p0, p1) = if pts.len() == 2 {
+                    (pts[0], pts[1])
+                } else {
+                    let mut best = (pts[0], pts[1]);
+                    let mut best_d2 = (pts[1] - pts[0]).length_squared();
+                    for i in 0..pts.len() {
+                        for j in (i + 1)..pts.len() {
+                            let d2 = (pts[j] - pts[i]).length_squared();
+                            if d2 > best_d2 {
+                                best = (pts[i], pts[j]);
+                                best_d2 = d2;
+                            }
+                        }
+                    }
+                    best
+                };
+
+                painter.line_segment([project(p0), project(p1)], stroke);
+            }
+        }
+    }
+}
+
+fn tri_axis_value(p: glam::Vec3, axis_index: usize) -> f32 {
+    match axis_index {
+        0 => p.z,
+        1 => p.y,
+        _ => p.x,
+    }
+}
+
+fn intersect_edge_with_slice(
+    p0: glam::Vec3,
+    p1: glam::Vec3,
+    axis_index: usize,
+    slice_pos: f32,
+    eps: f32,
+) -> Option<glam::Vec3> {
+    let c0 = tri_axis_value(p0, axis_index);
+    let c1 = tri_axis_value(p1, axis_index);
+    let d0 = c0 - slice_pos;
+    let d1 = c1 - slice_pos;
+
+    // Coplanar edge: skip to avoid degenerate full-triangle artifacts.
+    if d0.abs() <= eps && d1.abs() <= eps {
+        return None;
+    }
+    if d0.abs() <= eps {
+        return Some(p0);
+    }
+    if d1.abs() <= eps {
+        return Some(p1);
+    }
+    if d0 * d1 > 0.0 {
+        return None;
+    }
+    let t = d0 / (d0 - d1);
+    Some(p0 + (p1 - p0) * t)
 }
 
 impl eframe::App for TrxViewerApp {
@@ -396,6 +592,17 @@ impl eframe::App for TrxViewerApp {
                     );
                 }
 
+                if ui.button("Open GIFTI Surface...").clicked() {
+                    if let Some(path) = rfd::FileDialog::new()
+                        .add_filter("GIFTI files", &["gii", "gifti"])
+                        .pick_file()
+                    {
+                        if let Some(rs) = frame.wgpu_render_state() {
+                            self.load_gifti_surface(&path, rs);
+                        }
+                    }
+                }
+
                 // Error display
                 if let Some(ref msg) = self.error_msg {
                     ui.separator();
@@ -419,6 +626,34 @@ impl eframe::App for TrxViewerApp {
                         "Dimensions: {}x{}x{}",
                         vol.dims[0], vol.dims[1], vol.dims[2]
                     ));
+                    ui.separator();
+                }
+
+                if !self.gifti_surfaces.is_empty() {
+                    ui.label("GIFTI Surfaces");
+                    for surface in &mut self.gifti_surfaces {
+                        ui.group(|ui| {
+                            ui.horizontal(|ui| {
+                                ui.checkbox(&mut surface.visible, "");
+                                ui.label(&surface.name);
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("Opacity");
+                                ui.add(egui::Slider::new(&mut surface.opacity, 0.0..=1.0));
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("Color");
+                                ui.color_edit_button_rgb(&mut surface.color);
+                            });
+                            ui.small(
+                                surface
+                                    .path
+                                    .file_name()
+                                    .map(|n| n.to_string_lossy().to_string())
+                                    .unwrap_or_default(),
+                            );
+                        });
+                    }
                     ui.separator();
                 }
 
@@ -712,9 +947,9 @@ impl eframe::App for TrxViewerApp {
 
         // ── Main content: 4 viewports ──
         egui::CentralPanel::default().show(ctx, |ui| {
-            if self.trx_data.is_none() && self.nifti_volume.is_none() {
+            if self.trx_data.is_none() && self.nifti_volume.is_none() && self.gifti_surfaces.is_empty() {
                 ui.centered_and_justified(|ui| {
-                    ui.label("Open a TRX or NIfTI file from the sidebar to begin.");
+                    ui.label("Open a TRX, NIfTI, or GIFTI file from the sidebar to begin.");
                 });
                 return;
             }
@@ -743,15 +978,30 @@ impl eframe::App for TrxViewerApp {
 
             let aspect_3d = rect_3d.width() / rect_3d.height().max(1.0);
             let vp_3d = self.camera_3d.view_projection(aspect_3d);
+            let surface_draws: Vec<(usize, MeshDrawStyle)> = self
+                .gifti_surfaces
+                .iter()
+                .filter(|s| s.visible)
+                .map(|s| {
+                    (
+                        s.gpu_index,
+                        MeshDrawStyle {
+                            color: [s.color[0], s.color[1], s.color[2], s.opacity],
+                        },
+                    )
+                })
+                .collect();
 
             ui.painter().add(egui_wgpu::Callback::new_paint_callback(
                 rect_3d,
                 Scene3DCallback {
                     view_proj: vp_3d,
+                    camera_pos: self.camera_3d.eye(),
                     has_streamlines: self.has_streamlines,
                     has_slices: self.has_slices,
                     window_center: self.window_center,
                     window_width: self.window_width,
+                    surface_draws,
                 },
             ));
 
@@ -860,6 +1110,7 @@ impl eframe::App for TrxViewerApp {
                         if self.sphere_query_active {
                             self.draw_sphere_circle(ui, rect, i, vp_slice, slice_pos);
                         }
+                        self.draw_mesh_intersections(ui, rect, i, vp_slice, slice_pos);
                     });
                 }
             });
@@ -980,22 +1231,24 @@ impl TrxViewerApp {
         _axis_index: usize,
         view_proj: glam::Mat4,
     ) {
-        // Project world-space direction endpoints to screen space
-        let far = 10000.0;
         let center = self.volume_center;
+        let axis_len = (self.volume_extent * 0.2).max(10.0);
 
-        // Define the 6 anatomical directions with labels
+        // Define the 6 anatomical directions as offsets from center.
         let directions: &[(Vec3, &str)] = &[
-            (Vec3::new(far, center.y, center.z), "R"),   // +X = Right
-            (Vec3::new(-far, center.y, center.z), "L"),   // -X = Left
-            (Vec3::new(center.x, far, center.z), "A"),   // +Y = Anterior
-            (Vec3::new(center.x, -far, center.z), "P"),   // -Y = Posterior
-            (Vec3::new(center.x, center.y, far), "S"),   // +Z = Superior
-            (Vec3::new(center.x, center.y, -far), "I"),   // -Z = Inferior
+            (Vec3::X * axis_len, "R"),  // +X = Right
+            (-Vec3::X * axis_len, "L"), // -X = Left
+            (Vec3::Y * axis_len, "A"),  // +Y = Anterior
+            (-Vec3::Y * axis_len, "P"), // -Y = Posterior
+            (Vec3::Z * axis_len, "S"),  // +Z = Superior
+            (-Vec3::Z * axis_len, "I"), // -Z = Inferior
         ];
 
         let project = |world: Vec3| -> egui::Pos2 {
             let clip = view_proj * world.extend(1.0);
+            if clip.w.abs() < 1e-6 {
+                return rect.center();
+            }
             let ndc_x = clip.x / clip.w;
             let ndc_y = clip.y / clip.w;
             egui::pos2(
@@ -1008,24 +1261,32 @@ impl TrxViewerApp {
         let label_color = egui::Color32::from_rgb(220, 220, 220);
         let font = egui::FontId::proportional(14.0);
         let margin = 16.0;
+        let center_screen = project(center);
 
-        // For each direction, check if the projected point is on a rect edge
-        for &(dir_point, label) in directions {
-            let p = project(dir_point);
-            // Only draw if the point projects to near an edge of the rect
-            let on_left = (p.x - rect.left()).abs() < margin * 2.0;
-            let on_right = (p.x - rect.right()).abs() < margin * 2.0;
-            let on_top = (p.y - rect.top()).abs() < margin * 2.0;
-            let on_bottom = (p.y - rect.bottom()).abs() < margin * 2.0;
-
-            if !(on_left || on_right || on_top || on_bottom) {
-                continue; // This direction doesn't project to an edge (it's the look axis)
+        // Place labels by projecting a small offset and extending from center to the viewport edge.
+        for &(offset, label) in directions {
+            let p = project(center + offset);
+            let delta = egui::vec2(p.x - center_screen.x, p.y - center_screen.y);
+            let len2 = delta.length_sq();
+            // Skip look-axis directions that collapse to the center in this view.
+            if len2 < 1e-6 {
+                continue;
             }
-
-            // Clamp to rect edges with margin
+            let dir = delta / len2.sqrt();
+            let tx = if dir.x.abs() > 1e-6 {
+                ((rect.width() * 0.5 - margin) / dir.x.abs()).abs()
+            } else {
+                f32::INFINITY
+            };
+            let ty = if dir.y.abs() > 1e-6 {
+                ((rect.height() * 0.5 - margin) / dir.y.abs()).abs()
+            } else {
+                f32::INFINITY
+            };
+            let t = tx.min(ty);
             let label_pos = egui::pos2(
-                p.x.clamp(rect.left() + margin, rect.right() - margin),
-                p.y.clamp(rect.top() + margin, rect.bottom() - margin),
+                center_screen.x + dir.x * t,
+                center_screen.y + dir.y * t,
             );
 
             painter.text(
@@ -1087,10 +1348,12 @@ impl TrxViewerApp {
 
 struct Scene3DCallback {
     view_proj: glam::Mat4,
+    camera_pos: glam::Vec3,
     has_streamlines: bool,
     has_slices: bool,
     window_center: f32,
     window_width: f32,
+    surface_draws: Vec<(usize, MeshDrawStyle)>,
 }
 
 impl egui_wgpu::CallbackTrait for Scene3DCallback {
@@ -1107,6 +1370,18 @@ impl egui_wgpu::CallbackTrait for Scene3DCallback {
         }
         if let Some(res) = callback_resources.get_mut::<SliceResources>() {
             res.update_uniforms(queue, 0, self.view_proj, self.window_center, self.window_width);
+        }
+        if let Some(res) = callback_resources.get_mut::<MeshResources>() {
+            for (surface_index, style) in &self.surface_draws {
+                res.update_surface_uniforms(
+                    queue,
+                    *surface_index,
+                    0,
+                    self.view_proj,
+                    style.color,
+                    self.camera_pos,
+                );
+            }
         }
         Vec::new()
     }
@@ -1156,6 +1431,12 @@ impl egui_wgpu::CallbackTrait for Scene3DCallback {
                     wgpu::IndexFormat::Uint32,
                 );
                 render_pass.draw_indexed(0..sr.num_indices, 0, 0..1);
+            }
+        }
+
+        if !self.surface_draws.is_empty() {
+            if let Some(mr) = callback_resources.get::<MeshResources>() {
+                mr.paint(render_pass, 0, &self.surface_draws);
             }
         }
     }
