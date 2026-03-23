@@ -1,9 +1,11 @@
 use std::collections::HashSet;
+use std::collections::HashMap;
 use std::path::Path;
 
 use bytemuck::Pod;
 use glam::Vec3;
 use trx_rs::{AnyTrxFile, DType, TrxFile, TrxScalar};
+use crate::data::gifti_data::GiftiSurfaceData;
 
 /// Available coloring modes for streamline visualization.
 #[derive(Clone, Debug, PartialEq)]
@@ -177,40 +179,15 @@ impl TrxGpuData {
         max_count: usize,
         ordering: &[u32],
         sphere_indices: Option<&HashSet<u32>>,
+        surface_indices: Option<&HashSet<u32>>,
     ) -> Vec<u32> {
-        // Step 1: Collect visible streamline indices
-        let visible_set: Vec<u32> = if self.groups.is_empty() {
-            (0..self.nb_streamlines as u32).collect()
-        } else {
-            let mut v = Vec::new();
-            for (i, (_, members)) in self.groups.iter().enumerate() {
-                if i < visible_groups.len() && !visible_groups[i] {
-                    continue;
-                }
-                v.extend_from_slice(members);
-            }
-            v
-        };
-
-        // Step 2: If sphere filter active, intersect
-        let filtered: Vec<u32> = if let Some(sphere) = sphere_indices {
-            visible_set.into_iter().filter(|idx| sphere.contains(idx)).collect()
-        } else {
-            visible_set
-        };
-
-        // Step 3: Apply ordering and max count
-        let selected: Vec<u32> = if ordering.len() == self.nb_streamlines {
-            // Use ordering to pick which streamlines to show (supports random subsetting)
-            let filtered_set: HashSet<u32> = filtered.into_iter().collect();
-            ordering.iter()
-                .copied()
-                .filter(|idx| filtered_set.contains(idx))
-                .take(max_count)
-                .collect()
-        } else {
-            filtered.into_iter().take(max_count).collect()
-        };
+        let selected = self.filtered_streamline_indices(
+            visible_groups,
+            max_count,
+            ordering,
+            sphere_indices,
+            surface_indices,
+        );
 
         // Step 4: Build line-segment index pairs
         let mut indices = Vec::with_capacity(selected.len() * 100); // rough estimate
@@ -226,6 +203,50 @@ impl TrxGpuData {
             }
         }
         indices
+    }
+
+    /// Return the selected streamline indices after applying active filters.
+    pub fn filtered_streamline_indices(
+        &self,
+        visible_groups: &[bool],
+        max_count: usize,
+        ordering: &[u32],
+        sphere_indices: Option<&HashSet<u32>>,
+        surface_indices: Option<&HashSet<u32>>,
+    ) -> Vec<u32> {
+        // Step 1: Collect visible streamline indices
+        let visible_set: Vec<u32> = if self.groups.is_empty() {
+            (0..self.nb_streamlines as u32).collect()
+        } else {
+            let mut v = Vec::new();
+            for (i, (_, members)) in self.groups.iter().enumerate() {
+                if i < visible_groups.len() && !visible_groups[i] {
+                    continue;
+                }
+                v.extend_from_slice(members);
+            }
+            v
+        };
+
+        // Step 2: Spatial filter intersections
+        let filtered: Vec<u32> = visible_set
+            .into_iter()
+            .filter(|idx| sphere_indices.is_none_or(|set| set.contains(idx)))
+            .filter(|idx| surface_indices.is_none_or(|set| set.contains(idx)))
+            .collect();
+
+        // Step 3: Apply ordering and max count
+        if ordering.len() == self.nb_streamlines {
+            let filtered_set: HashSet<u32> = filtered.into_iter().collect();
+            ordering
+                .iter()
+                .copied()
+                .filter(|idx| filtered_set.contains(idx))
+                .take(max_count)
+                .collect()
+        } else {
+            filtered.into_iter().take(max_count).collect()
+        }
     }
 
     /// Query streamlines intersecting a sphere. Returns matching streamline indices.
@@ -257,6 +278,101 @@ impl TrxGpuData {
             }
         }
         result
+    }
+
+    /// Query streamlines that pass within `depth_mm` of the surface.
+    /// Uses streamline AABB and surface AABB broad phase, then nearest surface-vertex distance.
+    pub fn query_near_surface(
+        &self,
+        surface: &GiftiSurfaceData,
+        depth_mm: f32,
+    ) -> HashSet<u32> {
+        let mut result = HashSet::new();
+        if depth_mm <= 0.0 || surface.vertices.is_empty() {
+            return result;
+        }
+        let depth2 = depth_mm * depth_mm;
+        let smin = surface.bbox_min - Vec3::splat(depth_mm);
+        let smax = surface.bbox_max + Vec3::splat(depth_mm);
+        let grid = SurfaceSpatialGrid::build(&surface.vertices, depth_mm.max(0.5));
+
+        for si in 0..self.nb_streamlines {
+            let aabb = self.aabbs[si];
+            if !aabb_overlaps_expanded_surface(aabb, smin, smax) {
+                continue;
+            }
+            let start = self.offsets[si] as usize;
+            let end = self.offsets[si + 1] as usize;
+            for vi in start..end {
+                let p = Vec3::from(self.positions[vi]);
+                if p.x < smin.x || p.x > smax.x || p.y < smin.y || p.y > smax.y || p.z < smin.z || p.z > smax.z {
+                    continue;
+                }
+                if let Some((_, d2)) = grid.nearest_vertex(&surface.vertices, p) {
+                    if d2 <= depth2 {
+                        result.insert(si as u32);
+                        break;
+                    }
+                }
+            }
+        }
+        result
+    }
+
+    /// Project selected streamlines onto surface vertices.
+    /// Returns (density_count, mean_dps_value_or_nan) per surface vertex.
+    pub fn project_selected_to_surface(
+        &self,
+        surface: &GiftiSurfaceData,
+        selected_streamlines: &[u32],
+        depth_mm: f32,
+        dps_values: Option<&[f32]>,
+    ) -> (Vec<f32>, Vec<f32>) {
+        let n = surface.vertices.len();
+        let mut density = vec![0.0f32; n];
+        let mut dps_sum = vec![0.0f32; n];
+        let mut dps_count = vec![0u32; n];
+        if depth_mm <= 0.0 || n == 0 {
+            return (density, vec![f32::NAN; n]);
+        }
+
+        let depth2 = depth_mm * depth_mm;
+        let smin = surface.bbox_min - Vec3::splat(depth_mm);
+        let smax = surface.bbox_max + Vec3::splat(depth_mm);
+        let grid = SurfaceSpatialGrid::build(&surface.vertices, depth_mm.max(0.5));
+
+        for &si_u32 in selected_streamlines {
+            let si = si_u32 as usize;
+            if si + 1 >= self.offsets.len() {
+                continue;
+            }
+            let dps_val = dps_values.and_then(|d| d.get(si)).copied().unwrap_or(0.0);
+            let start = self.offsets[si] as usize;
+            let end = self.offsets[si + 1] as usize;
+            for vi in start..end {
+                let p = Vec3::from(self.positions[vi]);
+                if p.x < smin.x || p.x > smax.x || p.y < smin.y || p.y > smax.y || p.z < smin.z || p.z > smax.z {
+                    continue;
+                }
+                if let Some((nearest_idx, d2)) = grid.nearest_vertex(&surface.vertices, p) {
+                    if d2 <= depth2 {
+                        density[nearest_idx] += 1.0;
+                        if dps_values.is_some() {
+                            dps_sum[nearest_idx] += dps_val;
+                            dps_count[nearest_idx] += 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        let mean_dps: Vec<f32> = dps_sum
+            .iter()
+            .zip(dps_count.iter())
+            .map(|(&sum, &cnt)| if cnt > 0 { sum / cnt as f32 } else { f32::NAN })
+            .collect();
+
+        (density, mean_dps)
     }
 
     fn compute_group_colors(&self) -> Vec<[f32; 4]> {
@@ -490,4 +606,60 @@ fn expand_dps_to_vertices(
         }
     }
     scalar_to_colors(&per_vertex)
+}
+
+fn aabb_overlaps_expanded_surface(aabb: [f32; 6], smin: Vec3, smax: Vec3) -> bool {
+    !(aabb[3] < smin.x
+        || aabb[0] > smax.x
+        || aabb[4] < smin.y
+        || aabb[1] > smax.y
+        || aabb[5] < smin.z
+        || aabb[2] > smax.z)
+}
+
+struct SurfaceSpatialGrid {
+    cell_size: f32,
+    buckets: HashMap<(i32, i32, i32), Vec<usize>>,
+}
+
+impl SurfaceSpatialGrid {
+    fn build(vertices: &[[f32; 3]], cell_size: f32) -> Self {
+        let mut buckets: HashMap<(i32, i32, i32), Vec<usize>> = HashMap::new();
+        for (i, v) in vertices.iter().enumerate() {
+            let key = Self::key(Vec3::from(*v), cell_size);
+            buckets.entry(key).or_default().push(i);
+        }
+        Self { cell_size, buckets }
+    }
+
+    fn key(p: Vec3, cell_size: f32) -> (i32, i32, i32) {
+        (
+            (p.x / cell_size).floor() as i32,
+            (p.y / cell_size).floor() as i32,
+            (p.z / cell_size).floor() as i32,
+        )
+    }
+
+    fn nearest_vertex(&self, vertices: &[[f32; 3]], p: Vec3) -> Option<(usize, f32)> {
+        let (cx, cy, cz) = Self::key(p, self.cell_size);
+        let mut best: Option<(usize, f32)> = None;
+        for dz in -1..=1 {
+            for dy in -1..=1 {
+                for dx in -1..=1 {
+                    let key = (cx + dx, cy + dy, cz + dz);
+                    let Some(list) = self.buckets.get(&key) else {
+                        continue;
+                    };
+                    for &idx in list {
+                        let d2 = (Vec3::from(vertices[idx]) - p).length_squared();
+                        match best {
+                            Some((_, best_d2)) if d2 >= best_d2 => {}
+                            _ => best = Some((idx, d2)),
+                        }
+                    }
+                }
+            }
+        }
+        best
+    }
 }

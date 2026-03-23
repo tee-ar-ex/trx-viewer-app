@@ -11,7 +11,13 @@ struct MeshUniforms {
     shininess: f32,
     specular_strength: f32,
     ambient_strength: f32,
-    _pad: [f32; 2],
+    map_opacity: f32,
+    map_threshold: f32,
+    scalar_min: f32,
+    scalar_max: f32,
+    scalar_enabled: u32,
+    colormap: u32,
+    _pad: [u32; 1],
 }
 
 #[repr(C)]
@@ -23,6 +29,21 @@ struct MeshVertex {
 
 pub struct MeshDrawStyle {
     pub color: [f32; 4],
+    pub scalar_min: f32,
+    pub scalar_max: f32,
+    pub scalar_enabled: bool,
+    pub colormap: SurfaceColormap,
+    pub ambient_strength: f32,
+    pub gloss: f32,
+    pub map_opacity: f32,
+    pub map_threshold: f32,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum SurfaceColormap {
+    BlueWhiteRed = 0,
+    Viridis = 1,
+    Inferno = 2,
 }
 
 pub struct MeshResources {
@@ -32,6 +53,7 @@ pub struct MeshResources {
 
 struct GpuSurface {
     vertex_buffer: wgpu::Buffer,
+    scalar_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
     num_indices: u32,
     uniform_buffers: [wgpu::Buffer; 4],
@@ -86,6 +108,15 @@ impl MeshResources {
                             format: wgpu::VertexFormat::Float32x3,
                         },
                     ],
+                },
+                wgpu::VertexBufferLayout {
+                    array_stride: std::mem::size_of::<f32>() as wgpu::BufferAddress,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &[wgpu::VertexAttribute {
+                        offset: 0,
+                        shader_location: 2,
+                        format: wgpu::VertexFormat::Float32,
+                    }],
                 }],
                 compilation_options: Default::default(),
             },
@@ -96,7 +127,7 @@ impl MeshResources {
             },
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: wgpu::TextureFormat::Depth32Float,
-                depth_write_enabled: false,
+                depth_write_enabled: true,
                 depth_compare: wgpu::CompareFunction::LessEqual,
                 stencil: wgpu::StencilState::default(),
                 bias: wgpu::DepthBiasState::default(),
@@ -146,16 +177,27 @@ impl MeshResources {
             contents: bytemuck::cast_slice(&surface.indices),
             usage: wgpu::BufferUsages::INDEX,
         });
+        let scalar_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("gifti_surface_scalars"),
+            contents: bytemuck::cast_slice(&vec![0.0f32; surface.vertices.len()]),
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+        });
 
         let bind_group_layout = self.pipeline.get_bind_group_layout(0);
         let default_uniforms = MeshUniforms {
             view_proj: glam::Mat4::IDENTITY.to_cols_array_2d(),
             color: [0.7, 0.7, 0.7, 1.0],
             camera_pos: [0.0, 0.0, 1.0],
-            shininess: 48.0,
-            specular_strength: 0.35,
-            ambient_strength: 0.22,
-            _pad: [0.0, 0.0],
+            shininess: 24.0,
+            specular_strength: 0.18,
+            ambient_strength: 0.42,
+            map_opacity: 1.0,
+            map_threshold: 0.0,
+            scalar_min: 0.0,
+            scalar_max: 1.0,
+            scalar_enabled: 0,
+            colormap: SurfaceColormap::BlueWhiteRed as u32,
+            _pad: [0],
         };
 
         let uniform_buffers: [wgpu::Buffer; 4] = std::array::from_fn(|i| {
@@ -178,6 +220,7 @@ impl MeshResources {
 
         self.surfaces.push(GpuSurface {
             vertex_buffer,
+            scalar_buffer,
             index_buffer,
             num_indices: surface.indices.len() as u32,
             uniform_buffers,
@@ -192,24 +235,41 @@ impl MeshResources {
         surface_index: usize,
         viewport: usize,
         view_proj: glam::Mat4,
-        color: [f32; 4],
+        style: &MeshDrawStyle,
         camera_pos: glam::Vec3,
     ) {
         if let Some(surface) = self.surfaces.get(surface_index) {
             let uniforms = MeshUniforms {
                 view_proj: view_proj.to_cols_array_2d(),
-                color,
+                color: style.color,
                 camera_pos: camera_pos.into(),
-                shininess: 48.0,
-                specular_strength: 0.35,
-                ambient_strength: 0.22,
-                _pad: [0.0, 0.0],
+                shininess: 8.0 + 80.0 * style.gloss.clamp(0.0, 1.0),
+                specular_strength: 0.02 + 0.28 * style.gloss.clamp(0.0, 1.0),
+                ambient_strength: style.ambient_strength.clamp(0.0, 1.0),
+                map_opacity: style.map_opacity.clamp(0.0, 1.0),
+                map_threshold: style.map_threshold.clamp(0.0, 1.0),
+                scalar_min: style.scalar_min,
+                scalar_max: style.scalar_max,
+                scalar_enabled: if style.scalar_enabled { 1 } else { 0 },
+                colormap: style.colormap as u32,
+                _pad: [0],
             };
             queue.write_buffer(
                 &surface.uniform_buffers[viewport],
                 0,
                 bytemuck::bytes_of(&uniforms),
             );
+        }
+    }
+
+    pub fn update_surface_scalars(
+        &self,
+        queue: &wgpu::Queue,
+        surface_index: usize,
+        scalars: &[f32],
+    ) {
+        if let Some(surface) = self.surfaces.get(surface_index) {
+            queue.write_buffer(&surface.scalar_buffer, 0, bytemuck::cast_slice(scalars));
         }
     }
 
@@ -227,6 +287,7 @@ impl MeshResources {
                 }
                 render_pass.set_bind_group(0, &surface.bind_groups[viewport], &[]);
                 render_pass.set_vertex_buffer(0, surface.vertex_buffer.slice(..));
+                render_pass.set_vertex_buffer(1, surface.scalar_buffer.slice(..));
                 render_pass.set_index_buffer(
                     surface.index_buffer.slice(..),
                     wgpu::IndexFormat::Uint32,

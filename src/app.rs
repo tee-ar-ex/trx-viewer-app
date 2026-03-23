@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use glam::Vec3;
@@ -7,7 +7,7 @@ use crate::data::gifti_data::GiftiSurfaceData;
 use crate::data::nifti_data::NiftiVolume;
 use crate::data::trx_data::{ColorMode, TrxGpuData};
 use crate::renderer::camera::{OrbitCamera, OrthoSliceCamera};
-use crate::renderer::mesh_renderer::{MeshDrawStyle, MeshResources};
+use crate::renderer::mesh_renderer::{MeshDrawStyle, MeshResources, SurfaceColormap};
 use crate::renderer::slice_renderer::{SliceAxis, SliceResources};
 use crate::renderer::streamline_renderer::StreamlineResources;
 
@@ -19,6 +19,41 @@ struct LoadedGiftiSurface {
     visible: bool,
     opacity: f32,
     color: [f32; 3],
+    show_projection_map: bool,
+    map_opacity: f32,
+    map_threshold: f32,
+    surface_ambient: f32,
+    surface_gloss: f32,
+    projection_mode: SurfaceProjectionMode,
+    projection_dps: Option<String>,
+    projection_depth_mm: f32,
+    projection_colormap: SurfaceColormap,
+    auto_range: bool,
+    range_min: f32,
+    range_max: f32,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum SurfaceProjectionMode {
+    Density,
+    MeanDps,
+}
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct SurfaceProjectionCacheKey {
+    surface_idx: usize,
+    selection_revision: u64,
+    depth_bin: i32,
+    mode: SurfaceProjectionMode,
+    dps_name: Option<String>,
+}
+
+#[derive(Clone)]
+struct SurfaceProjectionCacheValue {
+    density: Vec<f32>,
+    mean_dps: Vec<f32>,
+    data_min: f32,
+    data_max: f32,
 }
 
 /// Main application state.
@@ -42,10 +77,22 @@ pub struct TrxViewerApp {
     error_msg: Option<String>,
     /// Loaded GIFTI surfaces.
     gifti_surfaces: Vec<LoadedGiftiSurface>,
+    /// Optional streamline filter based on distance to a selected surface.
+    surface_query_active: bool,
+    surface_query_surface: usize,
+    surface_query_result: Option<HashSet<u32>>,
+    /// Monotonic revision of streamline selection/filter state.
+    selection_revision: u64,
+    /// Cached surface projection maps keyed by active parameters.
+    surface_projection_cache: HashMap<SurfaceProjectionCacheKey, SurfaceProjectionCacheValue>,
+    /// Whether projections should be recomputed from current filters/settings.
+    surface_projection_dirty: bool,
     /// Current coloring mode.
     color_mode: ColorMode,
     /// Whether vertex colors need re-upload.
     colors_dirty: bool,
+    /// Global streamline visibility toggle.
+    show_streamlines: bool,
     /// Group visibility (one bool per group, all visible by default).
     group_visible: Vec<bool>,
     /// Whether the index buffer needs rebuild.
@@ -95,8 +142,15 @@ impl TrxViewerApp {
             volume_extent: 200.0,
             error_msg: None,
             gifti_surfaces: Vec::new(),
+            surface_query_active: false,
+            surface_query_surface: 0,
+            surface_query_result: None,
+            selection_revision: 0,
+            surface_projection_cache: HashMap::new(),
+            surface_projection_dirty: false,
             color_mode: ColorMode::DirectionRgb,
             colors_dirty: false,
+            show_streamlines: true,
             group_visible: Vec::new(),
             indices_dirty: false,
             uniform_color: [1.0, 1.0, 1.0, 1.0],
@@ -146,6 +200,11 @@ impl TrxViewerApp {
                 self.use_random_subset = false;
                 self.sphere_query_active = false;
                 self.sphere_query_result = None;
+                self.surface_query_active = false;
+                self.surface_query_result = None;
+                self.selection_revision = self.selection_revision.wrapping_add(1);
+                self.surface_projection_cache.clear();
+                self.surface_projection_dirty = true;
                 // Apply max streamline limit on initial load
                 if data.nb_streamlines > self.max_streamlines {
                     self.indices_dirty = true;
@@ -246,7 +305,20 @@ impl TrxViewerApp {
                     visible: true,
                     opacity: 0.7,
                     color,
+                    show_projection_map: false,
+                    map_opacity: 1.0,
+                    map_threshold: 0.0,
+                    surface_ambient: 0.42,
+                    surface_gloss: 0.45,
+                    projection_mode: SurfaceProjectionMode::Density,
+                    projection_dps: None,
+                    projection_depth_mm: 2.0,
+                    projection_colormap: SurfaceColormap::Inferno,
+                    auto_range: true,
+                    range_min: 0.0,
+                    range_max: 1.0,
                 });
+                self.surface_projection_dirty = true;
                 self.error_msg = None;
             }
             Err(e) => {
@@ -367,6 +439,109 @@ impl TrxViewerApp {
         }
     }
 
+    fn recompute_surface_query(&mut self) {
+        if !self.surface_query_active {
+            self.surface_query_result = None;
+            self.indices_dirty = true;
+            return;
+        }
+        let Some(data) = &self.trx_data else {
+            self.surface_query_result = None;
+            self.indices_dirty = true;
+            return;
+        };
+        if self.surface_query_surface >= self.gifti_surfaces.len() {
+            self.surface_query_result = None;
+            self.indices_dirty = true;
+            return;
+        }
+        let surf = &self.gifti_surfaces[self.surface_query_surface];
+        let depth = surf.projection_depth_mm.max(0.0);
+        self.surface_query_result = Some(data.query_near_surface(&surf.data, depth));
+        self.indices_dirty = true;
+    }
+
+    fn refresh_surface_projections(&mut self, frame: &mut eframe::Frame) {
+        let Some(data) = &self.trx_data else {
+            return;
+        };
+        if self.gifti_surfaces.is_empty() {
+            return;
+        }
+        let selected = data.filtered_streamline_indices(
+            &self.group_visible,
+            self.max_streamlines,
+            &self.streamline_order,
+            self.sphere_query_result.as_ref(),
+            self.surface_query_result.as_ref(),
+        );
+
+        let mut upload_scalars: Vec<(usize, Vec<f32>)> = Vec::new();
+
+        for (surface_idx, surface) in self.gifti_surfaces.iter_mut().enumerate() {
+            let key = SurfaceProjectionCacheKey {
+                surface_idx,
+                selection_revision: self.selection_revision,
+                depth_bin: (surface.projection_depth_mm * 100.0).round() as i32,
+                mode: surface.projection_mode,
+                dps_name: surface.projection_dps.clone(),
+            };
+
+            if !self.surface_projection_cache.contains_key(&key) {
+                let dps_values = surface
+                    .projection_dps
+                    .as_ref()
+                    .and_then(|name| data.dps_data.iter().find(|(n, _)| n == name).map(|(_, v)| v.as_slice()));
+                let (density, mean_dps) = data.project_selected_to_surface(
+                    &surface.data,
+                    &selected,
+                    surface.projection_depth_mm.max(0.0),
+                    dps_values,
+                );
+                let active: Vec<f32> = match surface.projection_mode {
+                    SurfaceProjectionMode::Density => density.iter().copied().filter(|v| v.is_finite()).collect(),
+                    SurfaceProjectionMode::MeanDps => mean_dps.iter().copied().filter(|v| v.is_finite()).collect(),
+                };
+                let (data_min, data_max) = robust_range(&active);
+                self.surface_projection_cache.insert(
+                    key.clone(),
+                    SurfaceProjectionCacheValue {
+                        density,
+                        mean_dps,
+                        data_min,
+                        data_max,
+                    },
+                );
+            }
+
+            if let Some(cached) = self.surface_projection_cache.get(&key) {
+                let active_values = match surface.projection_mode {
+                    SurfaceProjectionMode::Density => &cached.density,
+                    SurfaceProjectionMode::MeanDps => &cached.mean_dps,
+                };
+                if surface.auto_range {
+                    surface.range_min = cached.data_min;
+                    surface.range_max = cached.data_max;
+                }
+                let fill_value = surface.range_min;
+                let scalars: Vec<f32> = active_values
+                    .iter()
+                    .map(|v| if v.is_finite() { *v } else { fill_value })
+                    .collect();
+                upload_scalars.push((surface.gpu_index, scalars));
+            }
+        }
+
+        if let Some(rs) = frame.wgpu_render_state() {
+            let renderer = rs.renderer.read();
+            if let Some(mr) = renderer.callback_resources.get::<MeshResources>() {
+                for (gpu_index, scalars) in upload_scalars {
+                    mr.update_surface_scalars(&rs.queue, gpu_index, &scalars);
+                }
+            }
+        }
+    }
+
     fn draw_mesh_intersections(
         &self,
         ui: &egui::Ui,
@@ -475,6 +650,20 @@ fn tri_axis_value(p: glam::Vec3, axis_index: usize) -> f32 {
     }
 }
 
+fn robust_range(values: &[f32]) -> (f32, f32) {
+    let mut finite: Vec<f32> = values.iter().copied().filter(|v| v.is_finite()).collect();
+    if finite.is_empty() {
+        return (0.0, 1.0);
+    }
+    finite.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let n = finite.len();
+    let lo_idx = ((n as f32) * 0.02).floor() as usize;
+    let hi_idx = ((n as f32) * 0.98).floor() as usize;
+    let lo = finite[lo_idx.min(n - 1)];
+    let hi = finite[hi_idx.min(n - 1)].max(lo + 1e-6);
+    (lo, hi)
+}
+
 fn intersect_edge_with_slice(
     p0: glam::Vec3,
     p1: glam::Vec3,
@@ -538,6 +727,7 @@ impl eframe::App for TrxViewerApp {
                     self.max_streamlines,
                     &self.streamline_order,
                     self.sphere_query_result.as_ref(),
+                    self.surface_query_result.as_ref(),
                 );
                 let mut renderer = rs.renderer.write();
                 if let Some(sr) = renderer.callback_resources.get_mut::<StreamlineResources>() {
@@ -545,6 +735,13 @@ impl eframe::App for TrxViewerApp {
                 }
             }
             self.indices_dirty = false;
+            self.selection_revision = self.selection_revision.wrapping_add(1);
+            self.surface_projection_dirty = true;
+        }
+
+        if self.surface_projection_dirty {
+            self.refresh_surface_projections(frame);
+            self.surface_projection_dirty = false;
         }
 
         // ── Sidebar ──
@@ -616,6 +813,7 @@ impl eframe::App for TrxViewerApp {
                     ui.label("TRX Info");
                     ui.small(format!("Streamlines: {}", data.nb_streamlines));
                     ui.small(format!("Vertices: {}", data.nb_vertices));
+                    ui.checkbox(&mut self.show_streamlines, "Show streamlines");
                     ui.separator();
                 }
 
@@ -631,7 +829,49 @@ impl eframe::App for TrxViewerApp {
 
                 if !self.gifti_surfaces.is_empty() {
                     ui.label("GIFTI Surfaces");
-                    for surface in &mut self.gifti_surfaces {
+                    let dps_names_all = self
+                        .trx_data
+                        .as_ref()
+                        .map(|d| d.dps_names.clone())
+                        .unwrap_or_default();
+                    let mut query_changed = false;
+                    let mut projection_changed = false;
+
+                    ui.group(|ui| {
+                        ui.checkbox(&mut self.surface_query_active, "Use surface depth filter");
+                        ui.horizontal(|ui| {
+                            ui.label("Filter surface");
+                            let current = self
+                                .gifti_surfaces
+                                .get(self.surface_query_surface)
+                                .map(|s| s.name.clone())
+                                .unwrap_or_else(|| "none".to_string());
+                            egui::ComboBox::from_id_salt("surface_query_surface")
+                                .selected_text(current)
+                                .show_ui(ui, |ui| {
+                                    for (i, s) in self.gifti_surfaces.iter().enumerate() {
+                                        if ui
+                                            .selectable_value(&mut self.surface_query_surface, i, &s.name)
+                                            .changed()
+                                        {
+                                            query_changed = true;
+                                        }
+                                    }
+                                });
+                        });
+                        if self.surface_query_surface < self.gifti_surfaces.len() {
+                            let depth = &mut self.gifti_surfaces[self.surface_query_surface].projection_depth_mm;
+                            if ui
+                                .add(egui::Slider::new(depth, 0.1..=20.0).text("Depth mm"))
+                                .changed()
+                            {
+                                query_changed = true;
+                                projection_changed = true;
+                            }
+                        }
+                    });
+
+                    for (surface_idx, surface) in self.gifti_surfaces.iter_mut().enumerate() {
                         ui.group(|ui| {
                             ui.horizontal(|ui| {
                                 ui.checkbox(&mut surface.visible, "");
@@ -645,6 +885,174 @@ impl eframe::App for TrxViewerApp {
                                 ui.label("Color");
                                 ui.color_edit_button_rgb(&mut surface.color);
                             });
+                            ui.horizontal(|ui| {
+                                ui.label("Projection");
+                                if ui
+                                    .checkbox(&mut surface.show_projection_map, "Show map")
+                                    .changed()
+                                {
+                                    projection_changed = true;
+                                }
+                                egui::ComboBox::from_id_salt(format!("proj_mode_{surface_idx}"))
+                                    .selected_text(match surface.projection_mode {
+                                        SurfaceProjectionMode::Density => "Density",
+                                        SurfaceProjectionMode::MeanDps => "Mean DPS",
+                                    })
+                                    .show_ui(ui, |ui| {
+                                        if ui
+                                            .selectable_value(
+                                                &mut surface.projection_mode,
+                                                SurfaceProjectionMode::Density,
+                                                "Density",
+                                            )
+                                            .changed()
+                                        {
+                                            projection_changed = true;
+                                        }
+                                        if ui
+                                            .selectable_value(
+                                                &mut surface.projection_mode,
+                                                SurfaceProjectionMode::MeanDps,
+                                                "Mean DPS",
+                                            )
+                                            .changed()
+                                        {
+                                            projection_changed = true;
+                                        }
+                                    });
+                            });
+                            if matches!(surface.projection_mode, SurfaceProjectionMode::MeanDps) {
+                                let current = surface
+                                    .projection_dps
+                                    .clone()
+                                    .unwrap_or_else(|| "Select DPS".to_string());
+                                ui.horizontal(|ui| {
+                                    ui.label("DPS");
+                                    egui::ComboBox::from_id_salt(format!("proj_dps_{surface_idx}"))
+                                        .selected_text(current)
+                                        .show_ui(ui, |ui| {
+                                            for name in &dps_names_all {
+                                                if ui
+                                                    .selectable_label(
+                                                        surface.projection_dps.as_ref() == Some(name),
+                                                        name,
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    surface.projection_dps = Some(name.clone());
+                                                    projection_changed = true;
+                                                }
+                                            }
+                                        });
+                                });
+                            }
+                            ui.horizontal(|ui| {
+                                ui.label("Colormap");
+                                egui::ComboBox::from_id_salt(format!("proj_cmap_{surface_idx}"))
+                                    .selected_text(match surface.projection_colormap {
+                                        SurfaceColormap::BlueWhiteRed => "Blue-White-Red",
+                                        SurfaceColormap::Viridis => "Viridis",
+                                        SurfaceColormap::Inferno => "Inferno",
+                                    })
+                                    .show_ui(ui, |ui| {
+                                        if ui
+                                            .selectable_value(
+                                                &mut surface.projection_colormap,
+                                                SurfaceColormap::BlueWhiteRed,
+                                                "Blue-White-Red",
+                                            )
+                                            .changed()
+                                        {
+                                            projection_changed = true;
+                                        }
+                                        if ui
+                                            .selectable_value(
+                                                &mut surface.projection_colormap,
+                                                SurfaceColormap::Viridis,
+                                                "Viridis",
+                                            )
+                                            .changed()
+                                        {
+                                            projection_changed = true;
+                                        }
+                                        if ui
+                                            .selectable_value(
+                                                &mut surface.projection_colormap,
+                                                SurfaceColormap::Inferno,
+                                                "Inferno",
+                                            )
+                                            .changed()
+                                        {
+                                            projection_changed = true;
+                                        }
+                                    });
+                            });
+                            if surface.show_projection_map {
+                                ui.horizontal(|ui| {
+                                    ui.label("Map opacity");
+                                    if ui
+                                        .add(egui::Slider::new(&mut surface.map_opacity, 0.0..=1.0))
+                                        .changed()
+                                    {
+                                        projection_changed = true;
+                                    }
+                                });
+                                ui.horizontal(|ui| {
+                                    ui.label("Map threshold");
+                                    if ui
+                                        .add(egui::Slider::new(&mut surface.map_threshold, 0.0..=1.0))
+                                        .changed()
+                                    {
+                                        projection_changed = true;
+                                    }
+                                });
+                            }
+                            ui.horizontal(|ui| {
+                                ui.label("Ambient");
+                                if ui
+                                    .add(egui::Slider::new(&mut surface.surface_ambient, 0.0..=1.0))
+                                    .changed()
+                                {
+                                    projection_changed = true;
+                                }
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("Gloss");
+                                if ui
+                                    .add(egui::Slider::new(&mut surface.surface_gloss, 0.0..=1.0))
+                                    .changed()
+                                {
+                                    projection_changed = true;
+                                }
+                            });
+                            ui.horizontal(|ui| {
+                                if ui.checkbox(&mut surface.auto_range, "Auto range").changed() {
+                                    projection_changed = true;
+                                }
+                                if ui.button("Recompute").clicked() {
+                                    projection_changed = true;
+                                }
+                            });
+                            if !surface.auto_range {
+                                ui.horizontal(|ui| {
+                                    ui.label("Min");
+                                    if ui
+                                        .add(egui::DragValue::new(&mut surface.range_min).speed(0.01))
+                                        .changed()
+                                    {
+                                        projection_changed = true;
+                                    }
+                                });
+                                ui.horizontal(|ui| {
+                                    ui.label("Max");
+                                    if ui
+                                        .add(egui::DragValue::new(&mut surface.range_max).speed(0.01))
+                                        .changed()
+                                    {
+                                        projection_changed = true;
+                                    }
+                                });
+                            }
                             ui.small(
                                 surface
                                     .path
@@ -653,6 +1061,12 @@ impl eframe::App for TrxViewerApp {
                                     .unwrap_or_default(),
                             );
                         });
+                    }
+                    if query_changed {
+                        self.recompute_surface_query();
+                    }
+                    if projection_changed {
+                        self.surface_projection_dirty = true;
                     }
                     ui.separator();
                 }
@@ -987,6 +1401,14 @@ impl eframe::App for TrxViewerApp {
                         s.gpu_index,
                         MeshDrawStyle {
                             color: [s.color[0], s.color[1], s.color[2], s.opacity],
+                            scalar_min: s.range_min,
+                            scalar_max: s.range_max,
+                            scalar_enabled: s.show_projection_map,
+                            colormap: s.projection_colormap,
+                            ambient_strength: s.surface_ambient,
+                            gloss: s.surface_gloss,
+                            map_opacity: s.map_opacity,
+                            map_threshold: s.map_threshold,
                         },
                     )
                 })
@@ -998,6 +1420,7 @@ impl eframe::App for TrxViewerApp {
                     view_proj: vp_3d,
                     camera_pos: self.camera_3d.eye(),
                     has_streamlines: self.has_streamlines,
+                    show_streamlines: self.show_streamlines,
                     has_slices: self.has_slices,
                     window_center: self.window_center,
                     window_width: self.window_width,
@@ -1090,6 +1513,7 @@ impl eframe::App for TrxViewerApp {
                                 bind_group_index: i + 1,
                                 has_slices: self.has_slices,
                                 has_streamlines: self.has_streamlines,
+                                show_streamlines: self.show_streamlines,
                                 window_center: self.window_center,
                                 window_width: self.window_width,
                                 slab_axis,
@@ -1350,6 +1774,7 @@ struct Scene3DCallback {
     view_proj: glam::Mat4,
     camera_pos: glam::Vec3,
     has_streamlines: bool,
+    show_streamlines: bool,
     has_slices: bool,
     window_center: f32,
     window_width: f32,
@@ -1378,7 +1803,7 @@ impl egui_wgpu::CallbackTrait for Scene3DCallback {
                     *surface_index,
                     0,
                     self.view_proj,
-                    style.color,
+                    style,
                     self.camera_pos,
                 );
             }
@@ -1420,7 +1845,7 @@ impl egui_wgpu::CallbackTrait for Scene3DCallback {
             }
         }
 
-        if self.has_streamlines {
+        if self.has_streamlines && self.show_streamlines {
             if let Some(sr) = callback_resources.get::<StreamlineResources>() {
                 render_pass.set_pipeline(&sr.pipeline);
                 render_pass.set_bind_group(0, &sr.bind_groups[0], &[]);
@@ -1448,6 +1873,7 @@ struct SliceViewCallback {
     bind_group_index: usize,
     has_slices: bool,
     has_streamlines: bool,
+    show_streamlines: bool,
     window_center: f32,
     window_width: f32,
     /// Slab clipping axis for streamlines: 0=X, 1=Y, 2=Z.
@@ -1513,7 +1939,7 @@ impl egui_wgpu::CallbackTrait for SliceViewCallback {
             }
         }
 
-        if self.has_streamlines {
+        if self.has_streamlines && self.show_streamlines {
             if let Some(sr) = callback_resources.get::<StreamlineResources>() {
                 render_pass.set_pipeline(&sr.slice_pipeline);
                 render_pass.set_bind_group(0, &sr.bind_groups[self.bind_group_index], &[]);
