@@ -214,7 +214,7 @@ impl TrxViewerApp {
             bundle_mesh_source: BundleMeshSource::All,
             bundle_mesh_voxel_size: 2.0,
             bundle_mesh_threshold: 3.0,
-            bundle_mesh_smooth: 1.5,
+            bundle_mesh_smooth: 0.2,
             bundle_mesh_opacity: 0.5,
             bundle_mesh_ambient: 0.35,
             bundle_meshes_cpu: Vec::new(),
