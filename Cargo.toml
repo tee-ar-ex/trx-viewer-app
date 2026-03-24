@@ -29,3 +29,5 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 roxmltree = "0.20"
 base64 = "0.22"
 flate2 = "1"
+mcubes = "0.1.7"
+lin_alg = "1.3.5"

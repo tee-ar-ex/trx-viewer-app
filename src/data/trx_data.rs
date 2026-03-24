@@ -7,6 +7,19 @@ use glam::Vec3;
 use trx_rs::{AnyTrxFile, DType, TrxFile, TrxScalar};
 use crate::data::gifti_data::GiftiSurfaceData;
 
+/// Rendering style for streamlines.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RenderStyle {
+    /// Plain colored lines.
+    Flat = 0,
+    /// Zoeckler illuminated lines (tangent-based Phong).
+    Illuminated = 1,
+    /// Billboard tube impostors with cylinder shading.
+    Tubes = 2,
+    /// Depth-cued lines (brightness fades with camera distance).
+    DepthCue = 3,
+}
+
 /// Available coloring modes for streamline visualization.
 #[derive(Clone, Debug, PartialEq)]
 pub enum ColorMode {
@@ -44,6 +57,8 @@ pub struct TrxGpuData {
     pub dpv_data: Vec<(String, Vec<f32>)>,
     /// Cached DPS data: each entry is a flat Vec<f32> (one value per streamline).
     pub dps_data: Vec<(String, Vec<f32>)>,
+    /// Per-vertex tangent directions (normalized, unsigned).
+    pub tangents: Vec<[f32; 3]>,
     /// Current vertex colors.
     pub colors: Vec<[f32; 4]>,
     /// Full line-segment index buffer (all streamlines).
@@ -57,6 +72,22 @@ pub struct TrxGpuData {
 pub struct StreamlineVertex {
     pub position: [f32; 3],
     pub color: [f32; 4],
+}
+
+/// Per-corner vertex for tube impostor rendering.
+/// Each line segment expands to 4 of these (a billboard quad).
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct TubeVertex {
+    /// Segment start position.
+    pub p0: [f32; 3],
+    /// Segment end position.
+    pub p1: [f32; 3],
+    /// Vertex color (from the endpoint this corner belongs to).
+    pub color: [f32; 4],
+    /// Corner offset: x = lateral side (-1 or +1), y = end (-1=p0, +1=p1).
+    pub uv: [f32; 2],
+    pub _pad: [f32; 2],
 }
 
 impl TrxGpuData {
@@ -112,8 +143,10 @@ impl TrxGpuData {
         // Build full index buffer
         let all_indices = build_line_indices(&offsets);
 
+        // Compute tangents (used for illuminated rendering and direction-RGB colors)
+        let tangents = compute_tangents(&positions, &offsets);
         // Default: direction-RGB colors
-        let colors = compute_direction_colors(&positions, &offsets);
+        let colors = direction_colors_from_tangents(&tangents);
 
         // Compute per-streamline AABBs for spatial queries
         let aabbs = build_streamline_aabbs(&positions, &offsets);
@@ -130,6 +163,7 @@ impl TrxGpuData {
             groups,
             dpv_data,
             dps_data,
+            tangents,
             colors,
             all_indices,
             aabbs,
@@ -137,19 +171,22 @@ impl TrxGpuData {
     }
 
     /// Recompute vertex colors based on the given color mode.
-    pub fn recolor(&mut self, mode: &ColorMode) {
+    /// For scalar modes (DPV/DPS), `scalar_range` overrides automatic range detection.
+    pub fn recolor(&mut self, mode: &ColorMode, scalar_range: Option<(f32, f32)>) {
         self.colors = match mode {
-            ColorMode::DirectionRgb => compute_direction_colors(&self.positions, &self.offsets),
+            ColorMode::DirectionRgb => direction_colors_from_tangents(&self.tangents),
             ColorMode::Dpv(name) => {
                 if let Some((_, data)) = self.dpv_data.iter().find(|(n, _)| n == name) {
-                    scalar_to_colors(data)
+                    let (lo, hi) = scalar_range.unwrap_or_else(|| scalar_auto_range(data));
+                    scalar_to_colors_ranged(data, lo, hi)
                 } else {
                     vec![[0.5, 0.5, 0.5, 1.0]; self.nb_vertices]
                 }
             }
             ColorMode::Dps(name) => {
                 if let Some((_, data)) = self.dps_data.iter().find(|(n, _)| n == name) {
-                    expand_dps_to_vertices(data, &self.offsets, self.nb_vertices)
+                    let (lo, hi) = scalar_range.unwrap_or_else(|| scalar_auto_range(data));
+                    expand_dps_to_vertices_ranged(data, &self.offsets, self.nb_vertices, lo, hi)
                 } else {
                     vec![[0.5, 0.5, 0.5, 1.0]; self.nb_vertices]
                 }
@@ -157,6 +194,21 @@ impl TrxGpuData {
             ColorMode::Group => self.compute_group_colors(),
             ColorMode::Uniform(c) => vec![*c; self.nb_vertices],
         };
+    }
+
+    /// Compute the natural (robust) scalar range for the given color mode, if applicable.
+    pub fn scalar_range_for_mode(&self, mode: &ColorMode) -> Option<(f32, f32)> {
+        match mode {
+            ColorMode::Dpv(name) => {
+                self.dpv_data.iter().find(|(n, _)| n == name)
+                    .map(|(_, data)| scalar_auto_range(data))
+            }
+            ColorMode::Dps(name) => {
+                self.dps_data.iter().find(|(n, _)| n == name)
+                    .map(|(_, data)| scalar_auto_range(data))
+            }
+            _ => None,
+        }
     }
 
     /// Build interleaved vertex data from current positions + colors.
@@ -406,6 +458,60 @@ impl TrxGpuData {
         colors
     }
 
+    /// Return the world-space positions and current vertex colors for a set of
+    /// selected streamlines (by streamline index).  Used to feed the bundle mesh.
+    pub fn selected_vertex_data(
+        &self,
+        selected_streamlines: &[u32],
+    ) -> (Vec<[f32; 3]>, Vec<[f32; 4]>) {
+        let total: usize = selected_streamlines
+            .iter()
+            .map(|&si| (self.offsets[si as usize + 1] - self.offsets[si as usize]) as usize)
+            .sum();
+        let mut positions = Vec::with_capacity(total);
+        let mut colors    = Vec::with_capacity(total);
+        for &si in selected_streamlines {
+            let start = self.offsets[si as usize] as usize;
+            let end   = self.offsets[si as usize + 1] as usize;
+            positions.extend_from_slice(&self.positions[start..end]);
+            colors.extend_from_slice(&self.colors[start..end]);
+        }
+        (positions, colors)
+    }
+
+    /// Build tube impostor geometry for the given selected streamlines.
+    /// Returns (vertices, indices) for TriangleList rendering.
+    pub fn build_tube_vertices(&self, selected_streamlines: &[u32]) -> (Vec<TubeVertex>, Vec<u32>) {
+        let mut vertices: Vec<TubeVertex> = Vec::new();
+        let mut indices: Vec<u32> = Vec::new();
+
+        for &si in selected_streamlines {
+            let si = si as usize;
+            if si + 1 >= self.offsets.len() {
+                continue;
+            }
+            let start = self.offsets[si] as usize;
+            let end = self.offsets[si + 1] as usize;
+
+            for i in start..end.saturating_sub(1) {
+                let base = vertices.len() as u32;
+                let p0 = self.positions[i];
+                let p1 = self.positions[i + 1];
+                let c0 = self.colors[i];
+                let c1 = self.colors[i + 1];
+
+                // 4 corners: (lateral, end) in {-1,+1}²
+                vertices.push(TubeVertex { p0, p1, color: c0, uv: [-1.0, -1.0], _pad: [0.0; 2] });
+                vertices.push(TubeVertex { p0, p1, color: c0, uv: [ 1.0, -1.0], _pad: [0.0; 2] });
+                vertices.push(TubeVertex { p0, p1, color: c1, uv: [ 1.0,  1.0], _pad: [0.0; 2] });
+                vertices.push(TubeVertex { p0, p1, color: c1, uv: [-1.0,  1.0], _pad: [0.0; 2] });
+                indices.extend_from_slice(&[base, base+1, base+2, base, base+2, base+3]);
+            }
+        }
+
+        (vertices, indices)
+    }
+
     pub fn center(&self) -> Vec3 {
         (self.bbox_min + self.bbox_max) * 0.5
     }
@@ -496,10 +602,10 @@ fn extract_metadata<P: TrxScalar + Pod>(
     (dpv_data, dps_data, groups)
 }
 
-/// Compute direction-RGB colors: abs(normalized local tangent) for each vertex.
-fn compute_direction_colors(positions: &[[f32; 3]], offsets: &[u64]) -> Vec<[f32; 4]> {
+/// Compute per-vertex tangent directions (unsigned, normalized).
+pub fn compute_tangents(positions: &[[f32; 3]], offsets: &[u64]) -> Vec<[f32; 3]> {
     let n = positions.len();
-    let mut colors = vec![[0.5f32, 0.5, 0.5, 1.0]; n];
+    let mut tangents = vec![[0.5f32, 0.5, 0.5]; n];
 
     for win in offsets.windows(2) {
         let start = win[0] as usize;
@@ -507,22 +613,31 @@ fn compute_direction_colors(positions: &[[f32; 3]], offsets: &[u64]) -> Vec<[f32
         if end - start < 2 {
             continue;
         }
-
         for i in start..end {
-            let tangent = if i == start {
+            let raw = if i == start {
                 Vec3::from(positions[i + 1]) - Vec3::from(positions[i])
             } else if i == end - 1 {
                 Vec3::from(positions[i]) - Vec3::from(positions[i - 1])
             } else {
                 Vec3::from(positions[i + 1]) - Vec3::from(positions[i - 1])
             };
-
-            let t = tangent.normalize_or_zero().abs();
-            colors[i] = [t.x, t.y, t.z, 1.0];
+            let t = raw.normalize_or_zero();
+            tangents[i] = t.into();
         }
     }
 
-    colors
+    tangents
+}
+
+/// Compute direction-RGB colors from pre-computed tangents.
+fn direction_colors_from_tangents(tangents: &[[f32; 3]]) -> Vec<[f32; 4]> {
+    tangents
+        .iter()
+        .map(|&t| {
+            let v = Vec3::from(t).abs();
+            [v.x, v.y, v.z, 1.0]
+        })
+        .collect()
 }
 
 /// Build line-segment indices for PrimitiveTopology::LineList.
@@ -539,32 +654,40 @@ fn build_line_indices(offsets: &[u64]) -> Vec<u32> {
     indices
 }
 
-/// Map scalar values to a blue-red colormap.
-fn scalar_to_colors(values: &[f32]) -> Vec<[f32; 4]> {
-    let mut min_v = f32::INFINITY;
-    let mut max_v = f32::NEG_INFINITY;
-    for &v in values {
-        if v.is_finite() {
-            min_v = min_v.min(v);
-            max_v = max_v.max(v);
-        }
+/// Compute the robust scalar range (2nd–98th percentile) for a slice of values.
+pub fn scalar_auto_range(values: &[f32]) -> (f32, f32) {
+    let mut finite: Vec<f32> = values.iter().copied().filter(|v| v.is_finite()).collect();
+    if finite.is_empty() {
+        return (0.0, 1.0);
     }
-    let range = (max_v - min_v).max(1e-10);
+    finite.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let n = finite.len();
+    let lo = finite[((n as f32 * 0.02) as usize).min(n - 1)];
+    let hi = finite[((n as f32 * 0.98) as usize).min(n - 1)];
+    (lo, hi.max(lo + 1e-6))
+}
 
+/// Map scalar values to the blue→white→red colormap using an explicit range.
+pub fn scalar_to_colors_ranged(values: &[f32], min_v: f32, max_v: f32) -> Vec<[f32; 4]> {
+    let range = (max_v - min_v).max(1e-10);
     values
         .iter()
         .map(|&v| {
             let t = ((v - min_v) / range).clamp(0.0, 1.0);
-            // Blue (0) → White (0.5) → Red (1) colormap
-            if t < 0.5 {
-                let s = t * 2.0;
-                [s, s, 1.0, 1.0]
-            } else {
-                let s = (1.0 - t) * 2.0;
-                [1.0, s, s, 1.0]
-            }
+            colormap_bwr(t)
         })
         .collect()
+}
+
+/// Blue (0) → White (0.5) → Red (1) colormap at parameter t ∈ [0, 1].
+pub fn colormap_bwr(t: f32) -> [f32; 4] {
+    if t < 0.5 {
+        let s = t * 2.0;
+        [s, s, 1.0, 1.0]
+    } else {
+        let s = (1.0 - t) * 2.0;
+        [1.0, s, s, 1.0]
+    }
 }
 
 /// Compute per-streamline axis-aligned bounding boxes.
@@ -588,13 +711,14 @@ fn build_streamline_aabbs(positions: &[[f32; 3]], offsets: &[u64]) -> Vec<[f32; 
     aabbs
 }
 
-/// Expand per-streamline scalar values to per-vertex colors.
-fn expand_dps_to_vertices(
+/// Expand per-streamline scalar values to per-vertex colors using an explicit range.
+fn expand_dps_to_vertices_ranged(
     dps_values: &[f32],
     offsets: &[u64],
     nb_vertices: usize,
+    min_v: f32,
+    max_v: f32,
 ) -> Vec<[f32; 4]> {
-    // First expand to per-vertex scalars
     let mut per_vertex = vec![0.0f32; nb_vertices];
     for (si, &val) in dps_values.iter().enumerate() {
         if si + 1 < offsets.len() {
@@ -605,7 +729,7 @@ fn expand_dps_to_vertices(
             }
         }
     }
-    scalar_to_colors(&per_vertex)
+    scalar_to_colors_ranged(&per_vertex, min_v, max_v)
 }
 
 fn aabb_overlaps_expanded_surface(aabb: [f32; 6], smin: Vec3, smax: Vec3) -> bool {

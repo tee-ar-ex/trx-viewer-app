@@ -1,0 +1,162 @@
+name: Build Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            artifact_name: trx-viewer-linux
+          - os: windows-latest
+            artifact_name: trx-viewer-windows
+          - os: macos-latest
+            artifact_name: trx-viewer-macos
+
+    steps:
+      - name: Checkout trx-viewer-app
+        uses: actions/checkout@v4
+        with:
+          path: trx-viewer-app
+
+      - name: Checkout trx-rs
+        uses: actions/checkout@v4
+        with:
+          repository: tee-ar-ex/trx-rs
+          path: trx-rs
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: trx-viewer-app
+
+      - name: Install Linux system dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwayland-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev \
+            libx11-dev \
+            libxcb-render0-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev \
+            libxext-dev \
+            libglib2.0-dev \
+            libgtk-3-dev
+
+      - name: Build (release)
+        working-directory: trx-viewer-app
+        run: cargo build --release
+
+      # ── macOS: build .app bundle and .dmg ──────────────────────────────────
+      - name: Package macOS .app
+        if: runner.os == 'macOS'
+        working-directory: trx-viewer-app
+        run: |
+          APP="target/release/TRX Viewer.app"
+          MACOS_DIR="$APP/Contents/MacOS"
+          mkdir -p "$MACOS_DIR"
+          cp "target/release/trx-viewer-app" "$MACOS_DIR/TRX Viewer"
+
+          # Write minimal Info.plist
+          cat > "$APP/Contents/Info.plist" <<'PLIST'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+            "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleName</key><string>TRX Viewer</string>
+            <key>CFBundleIdentifier</key><string>com.trx-viewer.app</string>
+            <key>CFBundleVersion</key><string>${{ github.ref_name }}</string>
+            <key>CFBundleExecutable</key><string>TRX Viewer</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>LSMinimumSystemVersion</key><string>12.0</string>
+            <key>NSHighResolutionCapable</key><true/>
+          </dict>
+          </plist>
+          PLIST
+
+          # Copy icon if present
+          if [ -f assets/icon.icns ]; then
+            mkdir -p "$APP/Contents/Resources"
+            cp assets/icon.icns "$APP/Contents/Resources/"
+          fi
+
+          # Create .dmg
+          hdiutil create \
+            -volname "TRX Viewer" \
+            -srcfolder "$APP" \
+            -ov -format UDZO \
+            "target/release/TRX-Viewer-macos.dmg"
+
+      - name: Upload macOS artifact
+        if: runner.os == 'macOS'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: trx-viewer-app/target/release/TRX-Viewer-macos.dmg
+
+      # ── Windows: zip the .exe ──────────────────────────────────────────────
+      - name: Package Windows .zip
+        if: runner.os == 'Windows'
+        working-directory: trx-viewer-app
+        shell: pwsh
+        run: |
+          Compress-Archive `
+            -Path target\release\trx-viewer-app.exe `
+            -DestinationPath target\release\TRX-Viewer-windows.zip
+
+      - name: Upload Windows artifact
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: trx-viewer-app/target/release/TRX-Viewer-windows.zip
+
+      # ── Linux: .tar.gz ────────────────────────────────────────────────────
+      - name: Package Linux .tar.gz
+        if: runner.os == 'Linux'
+        working-directory: trx-viewer-app
+        run: |
+          tar -czf target/release/TRX-Viewer-linux.tar.gz \
+            -C target/release trx-viewer-app
+
+      - name: Upload Linux artifact
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: trx-viewer-app/target/release/TRX-Viewer-linux.tar.gz
+
+  # Optional: create a GitHub Release and attach all artifacts
+  release:
+    name: Create GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    permissions:
+      contents: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/**/*
+          generate_release_notes: true

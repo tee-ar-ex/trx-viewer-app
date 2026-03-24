@@ -1,15 +1,25 @@
 use wgpu::util::DeviceExt;
 
-use crate::data::trx_data::TrxGpuData;
+use crate::data::trx_data::{TrxGpuData, TubeVertex};
 
 /// GPU resources for streamline rendering.
 pub struct StreamlineResources {
+    /// Line-based pipeline (Flat / Illuminated / DepthCue modes). 3D viewport.
     pub pipeline: wgpu::RenderPipeline,
-    /// Pipeline for slice views (depth test Always, so streamlines aren't hidden behind NIfTI quad).
+    /// Line-based pipeline for slice views (depth Always).
     pub slice_pipeline: wgpu::RenderPipeline,
+    /// Tube impostor pipeline. 3D viewport.
+    pub tube_pipeline: wgpu::RenderPipeline,
+    /// Tube impostor pipeline for slice views (depth Always).
+    pub tube_slice_pipeline: wgpu::RenderPipeline,
     pub position_buffer: wgpu::Buffer,
     pub color_buffer: wgpu::Buffer,
+    pub tangent_buffer: wgpu::Buffer,
     pub index_buffer: wgpu::Buffer,
+    /// Tube geometry — rebuilt whenever the selected set changes.
+    pub tube_vertex_buffer: Option<wgpu::Buffer>,
+    pub tube_index_buffer: Option<wgpu::Buffer>,
+    pub num_tube_indices: u32,
     /// Per-viewport uniform buffers: [3D, axial, coronal, sagittal].
     pub uniform_buffers: [wgpu::Buffer; 4],
     /// Per-viewport bind groups.
@@ -17,15 +27,20 @@ pub struct StreamlineResources {
     pub num_indices: u32,
 }
 
+/// Must match the Uniforms struct in both streamline.wgsl and tube.wgsl.
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 struct Uniforms {
     view_proj: [[f32; 4]; 4],
+    camera_pos: [f32; 3],
+    /// 0=flat, 1=illuminated, 2=tubes (unused in line shader), 3=depth_cue
+    render_style: u32,
     /// Slab clipping axis: 0=X, 1=Y, 2=Z, 3=disabled.
     slab_axis: u32,
     slab_min: f32,
     slab_max: f32,
-    _pad: u32,
+    /// Tube radius (mm). Reused as depth_far for depth-cue mode.
+    tube_radius: f32,
 }
 
 impl StreamlineResources {
@@ -34,10 +49,17 @@ impl StreamlineResources {
         target_format: wgpu::TextureFormat,
         data: &TrxGpuData,
     ) -> Self {
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        let line_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("streamline_shader"),
             source: wgpu::ShaderSource::Wgsl(
                 include_str!("../shaders/streamline.wgsl").into(),
+            ),
+        });
+
+        let tube_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("tube_shader"),
+            source: wgpu::ShaderSource::Wgsl(
+                include_str!("../shaders/tube.wgsl").into(),
             ),
         });
 
@@ -55,13 +77,14 @@ impl StreamlineResources {
             }],
         });
 
-        // Create 4 uniform buffers and bind groups (3D + 3 slice viewports)
         let default_uniforms = Uniforms {
             view_proj: glam::Mat4::IDENTITY.to_cols_array_2d(),
-            slab_axis: 3, // disabled
+            camera_pos: [0.0; 3],
+            render_style: 0,
+            slab_axis: 3,
             slab_min: 0.0,
             slab_max: 0.0,
-            _pad: 0,
+            tube_radius: 0.5,
         };
 
         let uniform_buffers: [wgpu::Buffer; 4] = std::array::from_fn(|i| {
@@ -89,9 +112,9 @@ impl StreamlineResources {
             push_constant_ranges: &[],
         });
 
-        // Separate position and color vertex buffer layouts
+        // ── Line vertex buffer layouts (position + color + tangent) ──────────
         let position_layout = wgpu::VertexBufferLayout {
-            array_stride: (3 * std::mem::size_of::<f32>()) as wgpu::BufferAddress, // 12 bytes
+            array_stride: 12,
             step_mode: wgpu::VertexStepMode::Vertex,
             attributes: &[wgpu::VertexAttribute {
                 offset: 0,
@@ -99,9 +122,8 @@ impl StreamlineResources {
                 format: wgpu::VertexFormat::Float32x3,
             }],
         };
-
         let color_layout = wgpu::VertexBufferLayout {
-            array_stride: (4 * std::mem::size_of::<f32>()) as wgpu::BufferAddress, // 16 bytes
+            array_stride: 16,
             step_mode: wgpu::VertexStepMode::Vertex,
             attributes: &[wgpu::VertexAttribute {
                 offset: 0,
@@ -109,102 +131,53 @@ impl StreamlineResources {
                 format: wgpu::VertexFormat::Float32x4,
             }],
         };
+        let tangent_layout = wgpu::VertexBufferLayout {
+            array_stride: 12,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &[wgpu::VertexAttribute {
+                offset: 0,
+                shader_location: 2,
+                format: wgpu::VertexFormat::Float32x3,
+            }],
+        };
 
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("streamline_pipeline"),
-            layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_main"),
-                buffers: &[position_layout, color_layout],
-                compilation_options: Default::default(),
-            },
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::LineList,
-                strip_index_format: None,
-                front_face: wgpu::FrontFace::Ccw,
-                cull_mode: None,
-                polygon_mode: wgpu::PolygonMode::Fill,
-                unclipped_depth: false,
-                conservative: false,
-            },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: wgpu::TextureFormat::Depth32Float,
-                depth_write_enabled: true,
-                depth_compare: wgpu::CompareFunction::Less,
-                stencil: wgpu::StencilState::default(),
-                bias: wgpu::DepthBiasState::default(),
-            }),
-            multisample: wgpu::MultisampleState::default(),
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_main"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: target_format,
-                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: Default::default(),
-            }),
-            multiview: None,
-            cache: None,
-        });
+        // ── Tube vertex buffer layout (single interleaved buffer) ────────────
+        // TubeVertex layout: p0(12) + p1(12) + color(16) + uv(8) + _pad(8) = 56 bytes
+        let tube_stride = std::mem::size_of::<TubeVertex>() as wgpu::BufferAddress;
+        let tube_layout = wgpu::VertexBufferLayout {
+            array_stride: tube_stride,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &[
+                wgpu::VertexAttribute { offset: 0,  shader_location: 0, format: wgpu::VertexFormat::Float32x3 }, // p0
+                wgpu::VertexAttribute { offset: 12, shader_location: 1, format: wgpu::VertexFormat::Float32x3 }, // p1
+                wgpu::VertexAttribute { offset: 24, shader_location: 2, format: wgpu::VertexFormat::Float32x4 }, // color
+                wgpu::VertexAttribute { offset: 40, shader_location: 3, format: wgpu::VertexFormat::Float32x2 }, // uv
+            ],
+        };
 
-        // Slice view pipeline: depth test Always so streamlines aren't hidden behind NIfTI quad
-        let slice_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("streamline_slice_pipeline"),
-            layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_main"),
-                buffers: &[
-                    wgpu::VertexBufferLayout {
-                        array_stride: 12,
-                        step_mode: wgpu::VertexStepMode::Vertex,
-                        attributes: &[wgpu::VertexAttribute {
-                            offset: 0,
-                            shader_location: 0,
-                            format: wgpu::VertexFormat::Float32x3,
-                        }],
-                    },
-                    wgpu::VertexBufferLayout {
-                        array_stride: 16,
-                        step_mode: wgpu::VertexStepMode::Vertex,
-                        attributes: &[wgpu::VertexAttribute {
-                            offset: 0,
-                            shader_location: 1,
-                            format: wgpu::VertexFormat::Float32x4,
-                        }],
-                    },
-                ],
-                compilation_options: Default::default(),
-            },
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::LineList,
-                cull_mode: None,
-                ..Default::default()
-            },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: wgpu::TextureFormat::Depth32Float,
-                depth_write_enabled: false,
-                depth_compare: wgpu::CompareFunction::Always,
-                stencil: wgpu::StencilState::default(),
-                bias: wgpu::DepthBiasState::default(),
-            }),
-            multisample: wgpu::MultisampleState::default(),
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_main"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: target_format,
-                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: Default::default(),
-            }),
-            multiview: None,
-            cache: None,
-        });
+        let pipeline = Self::make_line_pipeline(
+            device, &pipeline_layout, &line_shader, target_format,
+            &[position_layout.clone(), color_layout.clone(), tangent_layout.clone()],
+            wgpu::CompareFunction::Less, true,
+        );
+
+        let slice_pipeline = Self::make_line_pipeline(
+            device, &pipeline_layout, &line_shader, target_format,
+            &[position_layout, color_layout, tangent_layout],
+            wgpu::CompareFunction::Always, false,
+        );
+
+        let tube_pipeline = Self::make_tube_pipeline(
+            device, &pipeline_layout, &tube_shader, target_format,
+            &[tube_layout.clone()],
+            wgpu::CompareFunction::Less, true,
+        );
+
+        let tube_slice_pipeline = Self::make_tube_pipeline(
+            device, &pipeline_layout, &tube_shader, target_format,
+            &[tube_layout],
+            wgpu::CompareFunction::Always, false,
+        );
 
         let position_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("streamline_positions"),
@@ -218,6 +191,12 @@ impl StreamlineResources {
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
         });
 
+        let tangent_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("streamline_tangents"),
+            contents: bytemuck::cast_slice(&data.tangents),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+
         let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("streamline_indices"),
             contents: bytemuck::cast_slice(&data.all_indices),
@@ -227,33 +206,135 @@ impl StreamlineResources {
         Self {
             pipeline,
             slice_pipeline,
+            tube_pipeline,
+            tube_slice_pipeline,
             position_buffer,
             color_buffer,
+            tangent_buffer,
             index_buffer,
+            tube_vertex_buffer: None,
+            tube_index_buffer: None,
+            num_tube_indices: 0,
             uniform_buffers,
             bind_groups,
             num_indices: data.all_indices.len() as u32,
         }
     }
 
+    fn make_line_pipeline(
+        device: &wgpu::Device,
+        layout: &wgpu::PipelineLayout,
+        shader: &wgpu::ShaderModule,
+        format: wgpu::TextureFormat,
+        buffers: &[wgpu::VertexBufferLayout<'_>],
+        depth_compare: wgpu::CompareFunction,
+        depth_write: bool,
+    ) -> wgpu::RenderPipeline {
+        device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("streamline_line_pipeline"),
+            layout: Some(layout),
+            vertex: wgpu::VertexState {
+                module: shader,
+                entry_point: Some("vs_main"),
+                buffers,
+                compilation_options: Default::default(),
+            },
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::LineList,
+                cull_mode: None,
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: depth_write,
+                depth_compare,
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            multiview: None,
+            cache: None,
+        })
+    }
+
+    fn make_tube_pipeline(
+        device: &wgpu::Device,
+        layout: &wgpu::PipelineLayout,
+        shader: &wgpu::ShaderModule,
+        format: wgpu::TextureFormat,
+        buffers: &[wgpu::VertexBufferLayout<'_>],
+        depth_compare: wgpu::CompareFunction,
+        depth_write: bool,
+    ) -> wgpu::RenderPipeline {
+        device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("streamline_tube_pipeline"),
+            layout: Some(layout),
+            vertex: wgpu::VertexState {
+                module: shader,
+                entry_point: Some("vs_main"),
+                buffers,
+                compilation_options: Default::default(),
+            },
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                cull_mode: None,
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: depth_write,
+                depth_compare,
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            multiview: None,
+            cache: None,
+        })
+    }
+
     /// Update uniforms for a specific viewport.
     /// `viewport`: 0=3D, 1=axial, 2=coronal, 3=sagittal.
-    /// `slab_axis`: 0=X, 1=Y, 2=Z, 3=disabled.
     pub fn update_uniforms(
         &self,
         queue: &wgpu::Queue,
         viewport: usize,
         view_proj: glam::Mat4,
+        camera_pos: glam::Vec3,
+        render_style: u32,
         slab_axis: u32,
         slab_min: f32,
         slab_max: f32,
+        tube_radius: f32,
     ) {
         let uniforms = Uniforms {
             view_proj: view_proj.to_cols_array_2d(),
+            camera_pos: camera_pos.into(),
+            render_style,
             slab_axis,
             slab_min,
             slab_max,
-            _pad: 0,
+            tube_radius,
         };
         queue.write_buffer(&self.uniform_buffers[viewport], 0, bytemuck::bytes_of(&uniforms));
     }
@@ -263,7 +344,7 @@ impl StreamlineResources {
         queue.write_buffer(&self.color_buffer, 0, bytemuck::cast_slice(colors));
     }
 
-    /// Replace the index buffer contents and update the draw count.
+    /// Replace the line index buffer contents and update the draw count.
     pub fn update_indices(
         &mut self,
         device: &wgpu::Device,
@@ -281,5 +362,51 @@ impl StreamlineResources {
             });
         }
         self.num_indices = indices.len() as u32;
+    }
+
+    /// Replace the tube geometry buffers.
+    pub fn update_tube_geometry(
+        &mut self,
+        device: &wgpu::Device,
+        vertices: &[TubeVertex],
+        indices: &[u32],
+    ) {
+        if vertices.is_empty() {
+            self.tube_vertex_buffer = None;
+            self.tube_index_buffer = None;
+            self.num_tube_indices = 0;
+            return;
+        }
+
+        // Each segment = 4 vertices (56 bytes each) + 6 indices (4 bytes each).
+        // Clamp to the device's 1 GB buffer limit.
+        const MAX_BUFFER_BYTES: usize = 1 << 30; // 1 GB
+        let max_verts = MAX_BUFFER_BYTES / std::mem::size_of::<TubeVertex>();
+        // Round down to a multiple of 4 so we never split a segment.
+        let max_verts = (max_verts / 4) * 4;
+        let max_indices = (max_verts / 4) * 6;
+
+        let truncated = vertices.len() > max_verts;
+        let vertices = &vertices[..vertices.len().min(max_verts)];
+        let indices  = &indices[..indices.len().min(max_indices)];
+
+        if truncated {
+            log::warn!(
+                "Tube geometry truncated to {} segments due to GPU buffer size limit.",
+                vertices.len() / 4,
+            );
+        }
+
+        self.tube_vertex_buffer = Some(device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("tube_vertices"),
+            contents: bytemuck::cast_slice(vertices),
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+        }));
+        self.tube_index_buffer = Some(device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("tube_indices"),
+            contents: bytemuck::cast_slice(indices),
+            usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+        }));
+        self.num_tube_indices = indices.len() as u32;
     }
 }

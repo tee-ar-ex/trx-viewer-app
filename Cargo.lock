@@ -1776,6 +1776,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "lin_alg"
+version = "1.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3d812240151a7d680ad7af1d657bd04e36cca3ac5e9f0ee3ee947498909c90e3"
+dependencies = [
+ "num-traits",
+ "paste",
+]
+
+[[package]]
 name = "linux-raw-sys"
 version = "0.4.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1831,6 +1841,15 @@ checksum = "a06de3016e9fae57a36fd14dba131fccf49f74b40b7fbdb472f96e361ec71a08"
 dependencies = [
  "autocfg",
  "rawpointer",
+]
+
+[[package]]
+name = "mcubes"
+version = "0.1.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "21305627b2a9263c95af711933a586d40a0ad97c232b28772133f8e6d59686f8"
+dependencies = [
+ "lin_alg",
 ]
 
 [[package]]
@@ -3253,7 +3272,9 @@ dependencies = [
  "glam",
  "half",
  "image",
+ "lin_alg",
  "log",
+ "mcubes",
  "ndarray",
  "nifti",
  "parking_lot",

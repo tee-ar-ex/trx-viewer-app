@@ -1,5 +1,6 @@
 use wgpu::util::DeviceExt;
 
+use crate::data::bundle_mesh::{BundleMesh, BundleMeshVertex};
 use crate::data::gifti_data::GiftiSurfaceData;
 
 #[repr(C)]
@@ -46,9 +47,30 @@ pub enum SurfaceColormap {
     Inferno = 2,
 }
 
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+struct BundleUniforms {
+    view_proj:  [[f32; 4]; 4],
+    camera_pos: [f32; 3],
+    opacity:    f32,
+    ambient:    f32,
+    _pad:       [f32; 3],  // pad to 96 bytes (vec3 align in WGSL)
+}
+
+struct BundleGpuSurface {
+    vertex_buffer: wgpu::Buffer,
+    index_buffer:  wgpu::Buffer,
+    num_indices:   u32,
+    uniform_buffer: wgpu::Buffer,
+    bind_group:     wgpu::BindGroup,
+}
+
 pub struct MeshResources {
     pub pipeline: wgpu::RenderPipeline,
     surfaces: Vec<GpuSurface>,
+    // Bundle surfaces — one per "slot" (all, selection, or one per group)
+    pub bundle_pipeline: wgpu::RenderPipeline,
+    bundle_surfaces: Vec<BundleGpuSurface>,
 }
 
 struct GpuSurface {
@@ -147,9 +169,84 @@ impl MeshResources {
             cache: None,
         });
 
+        // ── Bundle mesh pipeline ──────────────────────────────────────────────
+        let bundle_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("bundle_mesh_shader"),
+            source: wgpu::ShaderSource::Wgsl(
+                include_str!("../shaders/bundle_mesh.wgsl").into(),
+            ),
+        });
+
+        let bundle_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("bundle_mesh_bgl"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+
+        let bundle_pl_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("bundle_mesh_pl_layout"),
+            bind_group_layouts: &[&bundle_bgl],
+            push_constant_ranges: &[],
+        });
+
+        let bundle_stride = std::mem::size_of::<BundleMeshVertex>() as wgpu::BufferAddress;
+        let bundle_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("bundle_mesh_pipeline"),
+            layout: Some(&bundle_pl_layout),
+            vertex: wgpu::VertexState {
+                module: &bundle_shader,
+                entry_point: Some("vs_main"),
+                buffers: &[wgpu::VertexBufferLayout {
+                    array_stride: bundle_stride,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &[
+                        wgpu::VertexAttribute { offset: 0,  shader_location: 0, format: wgpu::VertexFormat::Float32x3 },
+                        wgpu::VertexAttribute { offset: 12, shader_location: 1, format: wgpu::VertexFormat::Float32x3 },
+                        wgpu::VertexAttribute { offset: 24, shader_location: 2, format: wgpu::VertexFormat::Float32x4 },
+                    ],
+                }],
+                compilation_options: Default::default(),
+            },
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                cull_mode: None, // two-sided (handled in shader)
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: true,
+                depth_compare: wgpu::CompareFunction::LessEqual,
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &bundle_shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: target_format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            multiview: None,
+            cache: None,
+        });
+
         Self {
             pipeline,
             surfaces: Vec::new(),
+            bundle_pipeline,
+            bundle_surfaces: Vec::new(),
         }
     }
 
@@ -295,5 +392,108 @@ impl MeshResources {
                 render_pass.draw_indexed(0..surface.num_indices, 0, 0..1);
             }
         }
+    }
+
+    // ── Bundle meshes (voxel density surfaces) ───────────────────────────────
+
+    fn make_bundle_gpu_surface(
+        &self,
+        device: &wgpu::Device,
+        mesh: &BundleMesh,
+        label: &str,
+    ) -> BundleGpuSurface {
+        let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some(&format!("bundle_verts_{label}")),
+            contents: bytemuck::cast_slice(&mesh.vertices),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+        let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some(&format!("bundle_idx_{label}")),
+            contents: bytemuck::cast_slice(&mesh.indices),
+            usage: wgpu::BufferUsages::INDEX,
+        });
+        let default_uniforms = BundleUniforms {
+            view_proj:  glam::Mat4::IDENTITY.to_cols_array_2d(),
+            camera_pos: [0.0; 3],
+            opacity:    0.5,
+            ambient:    0.35,
+            _pad:       [0.0; 3],
+        };
+        let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some(&format!("bundle_uni_{label}")),
+            contents: bytemuck::bytes_of(&default_uniforms),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+        let bgl = self.bundle_pipeline.get_bind_group_layout(0);
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some(&format!("bundle_bg_{label}")),
+            layout: &bgl,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: uniform_buffer.as_entire_binding(),
+            }],
+        });
+        BundleGpuSurface {
+            vertex_buffer,
+            index_buffer,
+            num_indices: mesh.indices.len() as u32,
+            uniform_buffer,
+            bind_group,
+        }
+    }
+
+    /// Replace all bundle surfaces with freshly-built meshes.
+    /// `meshes` is a slice of `(mesh, label)` pairs — one entry per source
+    /// (e.g. one for all streamlines, or one per group).
+    pub fn set_bundle_meshes(
+        &mut self,
+        device: &wgpu::Device,
+        meshes: &[(BundleMesh, String)],
+    ) {
+        self.bundle_surfaces = meshes
+            .iter()
+            .map(|(m, label)| self.make_bundle_gpu_surface(device, m, label))
+            .collect();
+    }
+
+    /// Update per-frame uniforms for every bundle surface (shared params).
+    pub fn update_bundle_uniforms(
+        &self,
+        queue:      &wgpu::Queue,
+        view_proj:  glam::Mat4,
+        camera_pos: glam::Vec3,
+        opacity:    f32,
+        ambient:    f32,
+    ) {
+        let uniforms = BundleUniforms {
+            view_proj:  view_proj.to_cols_array_2d(),
+            camera_pos: camera_pos.into(),
+            opacity,
+            ambient,
+            _pad: [0.0; 3],
+        };
+        for bs in &self.bundle_surfaces {
+            queue.write_buffer(&bs.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
+        }
+    }
+
+    /// Draw all bundle surfaces.
+    pub fn paint_bundle(&self, render_pass: &mut wgpu::RenderPass<'static>) {
+        if self.bundle_surfaces.is_empty() { return; }
+        render_pass.set_pipeline(&self.bundle_pipeline);
+        for bs in &self.bundle_surfaces {
+            render_pass.set_bind_group(0, &bs.bind_group, &[]);
+            render_pass.set_vertex_buffer(0, bs.vertex_buffer.slice(..));
+            render_pass.set_index_buffer(bs.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+            render_pass.draw_indexed(0..bs.num_indices, 0, 0..1);
+        }
+    }
+
+    pub fn has_bundle_mesh(&self) -> bool {
+        !self.bundle_surfaces.is_empty()
+    }
+
+    pub fn clear_bundle_mesh(&mut self) {
+        self.bundle_surfaces.clear();
     }
 }

@@ -3,13 +3,25 @@ use std::path::PathBuf;
 
 use glam::Vec3;
 
+use crate::data::bundle_mesh::{build_bundle_mesh, BundleMesh};
 use crate::data::gifti_data::GiftiSurfaceData;
 use crate::data::nifti_data::NiftiVolume;
-use crate::data::trx_data::{ColorMode, TrxGpuData};
+use crate::data::trx_data::{colormap_bwr, ColorMode, RenderStyle, scalar_auto_range, TrxGpuData};
 use crate::renderer::camera::{OrbitCamera, OrthoSliceCamera};
 use crate::renderer::mesh_renderer::{MeshDrawStyle, MeshResources, SurfaceColormap};
 use crate::renderer::slice_renderer::{SliceAxis, SliceResources};
 use crate::renderer::streamline_renderer::StreamlineResources;
+
+/// Source for the bundle surface mesh.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BundleMeshSource {
+    /// All streamlines in the file.
+    All,
+    /// Currently filtered / visible selection.
+    Selection,
+    /// One mesh per TRX group.
+    PerGroup,
+}
 
 struct LoadedGiftiSurface {
     name: String,
@@ -110,11 +122,38 @@ pub struct TrxViewerApp {
     streamline_order: Vec<u32>,
     /// Slab half-width for slice view streamline clipping (mm).
     slab_half_width: f32,
+    /// Active rendering style for streamlines.
+    render_style: RenderStyle,
+    /// Tube radius in mm (for Tubes mode).
+    tube_radius: f32,
+    /// Per-slice visibility in the 3D viewport [axial, coronal, sagittal].
+    slice_visible: [bool; 3],
+    /// World-space slice positions used when no NIfTI is loaded [axial(Z), coronal(Y), sagittal(X)].
+    slice_world_offsets: [f32; 3],
+    /// Whether scalar colormap range is auto-computed from data.
+    scalar_auto_range: bool,
+    /// Scalar colormap range (min, max) — used for DPV/DPS coloring.
+    scalar_range_min: f32,
+    scalar_range_max: f32,
     /// Sphere query state.
     sphere_query_active: bool,
     sphere_center: Vec3,
     sphere_radius: f32,
     sphere_query_result: Option<HashSet<u32>>,
+    /// Bundle surface (voxel density mesh).
+    show_bundle_mesh: bool,
+    bundle_mesh_source: BundleMeshSource,
+    bundle_mesh_voxel_size: f32,
+    bundle_mesh_threshold: f32,
+    bundle_mesh_smooth: f32,
+    bundle_mesh_opacity: f32,
+    bundle_mesh_ambient: f32,
+    /// CPU copy of the last-built bundle meshes (used for slice contour drawing).
+    bundle_meshes_cpu: Vec<BundleMesh>,
+    /// Pending background rebuild: receives (mesh, label) pairs when ready.
+    bundle_mesh_pending: Option<std::sync::mpsc::Receiver<Vec<(BundleMesh, String)>>>,
+    /// Instant at which the last rebuild was requested (for debounce).
+    bundle_mesh_dirty_at: Option<std::time::Instant>,
 }
 
 impl TrxViewerApp {
@@ -160,10 +199,27 @@ impl TrxViewerApp {
             use_random_subset: false,
             streamline_order: Vec::new(),
             slab_half_width: 5.0,
+            render_style: RenderStyle::Flat,
+            tube_radius: 0.4,
+            slice_visible: [true; 3],
+            slice_world_offsets: [0.0; 3],
+            scalar_auto_range: true,
+            scalar_range_min: 0.0,
+            scalar_range_max: 1.0,
             sphere_query_active: false,
             sphere_center: Vec3::ZERO,
             sphere_radius: 10.0,
             sphere_query_result: None,
+            show_bundle_mesh: false,
+            bundle_mesh_source: BundleMeshSource::All,
+            bundle_mesh_voxel_size: 2.0,
+            bundle_mesh_threshold: 3.0,
+            bundle_mesh_smooth: 1.5,
+            bundle_mesh_opacity: 0.5,
+            bundle_mesh_ambient: 0.35,
+            bundle_meshes_cpu: Vec::new(),
+            bundle_mesh_pending: None,
+            bundle_mesh_dirty_at: None,
         };
 
         if let Some(render_state) = &cc.wgpu_render_state {
@@ -189,8 +245,21 @@ impl TrxViewerApp {
 
                 let resources =
                     StreamlineResources::new(&rs.device, rs.target_format, &data);
-                rs.renderer.write().callback_resources.insert(resources);
+                {
+                    let mut renderer = rs.renderer.write();
+                    renderer.callback_resources.insert(resources);
+                    if renderer.callback_resources.get::<MeshResources>().is_none() {
+                        let mr = MeshResources::new(&rs.device, rs.target_format);
+                        renderer.callback_resources.insert(mr);
+                    }
+                }
 
+                // Initialise free-roam slice positions to the bounding-box centre.
+                self.slice_world_offsets = [
+                    self.volume_center.z,  // axial
+                    self.volume_center.y,  // coronal
+                    self.volume_center.x,  // sagittal
+                ];
                 self.has_streamlines = true;
                 self.trx_path = Some(path.clone());
                 self.group_visible = vec![true; data.groups.len()];
@@ -211,6 +280,10 @@ impl TrxViewerApp {
                 }
                 self.trx_data = Some(data);
                 self.error_msg = None;
+                // Trigger bundle mesh rebuild if it was already shown.
+                if self.show_bundle_mesh {
+                    self.bundle_mesh_dirty_at = Some(std::time::Instant::now());
+                }
             }
             Err(e) => {
                 self.error_msg = Some(format!("Failed to load TRX: {e}"));
@@ -435,7 +508,7 @@ impl TrxViewerApp {
                 _ => 0.0,
             }
         } else {
-            0.0
+            self.slice_world_offsets[axis_index]
         }
     }
 
@@ -550,7 +623,7 @@ impl TrxViewerApp {
         view_proj: glam::Mat4,
         slice_pos: f32,
     ) {
-        if self.gifti_surfaces.is_empty() {
+        if self.gifti_surfaces.is_empty() && (self.bundle_meshes_cpu.is_empty() || !self.show_bundle_mesh) {
             return;
         }
         let painter = ui.painter_at(rect);
@@ -639,6 +712,96 @@ impl TrxViewerApp {
                 painter.line_segment([project(p0), project(p1)], stroke);
             }
         }
+
+        // ── Bundle mesh contours ─────────────────────────────────────────────
+        if self.show_bundle_mesh {
+            for mesh in &self.bundle_meshes_cpu {
+                for tri in mesh.indices.chunks_exact(3) {
+                    let va = &mesh.vertices[tri[0] as usize];
+                    let vb = &mesh.vertices[tri[1] as usize];
+                    let vc = &mesh.vertices[tri[2] as usize];
+                    let a  = glam::Vec3::from(va.position);
+                    let b  = glam::Vec3::from(vb.position);
+                    let c  = glam::Vec3::from(vc.position);
+
+                    let tmin = tri_axis_value(a, axis_index)
+                        .min(tri_axis_value(b, axis_index))
+                        .min(tri_axis_value(c, axis_index));
+                    let tmax = tri_axis_value(a, axis_index)
+                        .max(tri_axis_value(b, axis_index))
+                        .max(tri_axis_value(c, axis_index));
+                    if slice_pos < tmin - eps || slice_pos > tmax + eps {
+                        continue;
+                    }
+
+                    // Find intersections, interpolating color along each edge.
+                    let mut pts: Vec<(glam::Vec3, [f32; 4])> = Vec::with_capacity(2);
+                    for (p0, c0, p1, c1) in [
+                        (a, va.color, b, vb.color),
+                        (b, vb.color, c, vc.color),
+                        (c, vc.color, a, va.color),
+                    ] {
+                        let d0 = tri_axis_value(p0, axis_index) - slice_pos;
+                        let d1 = tri_axis_value(p1, axis_index) - slice_pos;
+                        if d0.abs() <= eps && d1.abs() <= eps { continue; }
+                        let t = if d0.abs() <= eps { 0.0 }
+                                else if d1.abs() <= eps { 1.0 }
+                                else if d0 * d1 < 0.0 { d0 / (d0 - d1) }
+                                else { continue };
+                        let pos = p0 + (p1 - p0) * t;
+                        let col = [
+                            c0[0] + (c1[0] - c0[0]) * t,
+                            c0[1] + (c1[1] - c0[1]) * t,
+                            c0[2] + (c1[2] - c0[2]) * t,
+                            c0[3] + (c1[3] - c0[3]) * t,
+                        ];
+                        if !pts.iter().any(|(q, _)| (*q - pos).length_squared() <= eps * eps) {
+                            pts.push((pos, col));
+                        }
+                    }
+                    if pts.len() < 2 { continue; }
+                    let (p0, col0, p1, col1) = if pts.len() == 2 {
+                        (pts[0].0, pts[0].1, pts[1].0, pts[1].1)
+                    } else {
+                        let mut best = (pts[0].0, pts[0].1, pts[1].0, pts[1].1);
+                        let mut best_d2 = (pts[1].0 - pts[0].0).length_squared();
+                        for i in 0..pts.len() {
+                            for j in (i + 1)..pts.len() {
+                                let d2 = (pts[j].0 - pts[i].0).length_squared();
+                                if d2 > best_d2 { best = (pts[i].0, pts[i].1, pts[j].0, pts[j].1); best_d2 = d2; }
+                            }
+                        }
+                        best
+                    };
+
+                    let opacity_u8 = (self.bundle_mesh_opacity.clamp(0.0, 1.0) * 255.0) as u8;
+                    let to_color = |c: [f32; 4]| egui::Color32::from_rgba_unmultiplied(
+                        (c[0].clamp(0.0, 1.0) * 255.0) as u8,
+                        (c[1].clamp(0.0, 1.0) * 255.0) as u8,
+                        (c[2].clamp(0.0, 1.0) * 255.0) as u8,
+                        opacity_u8,
+                    );
+
+                    // Draw with gradient by blending colors at the two endpoints.
+                    let mid = (p0 + p1) * 0.5;
+                    let mid_col = [
+                        (col0[0] + col1[0]) * 0.5,
+                        (col0[1] + col1[1]) * 0.5,
+                        (col0[2] + col1[2]) * 0.5,
+                        (col0[3] + col1[3]) * 0.5,
+                    ];
+                    painter.line_segment(
+                        [project(p0), project(mid)],
+                        egui::Stroke::new(1.5, to_color(col0)),
+                    );
+                    painter.line_segment(
+                        [project(mid), project(p1)],
+                        egui::Stroke::new(1.5, to_color(mid_col)),
+                    );
+                    let _ = (col1, mid_col);
+                }
+            }
+        }
     }
 }
 
@@ -647,6 +810,21 @@ fn tri_axis_value(p: glam::Vec3, axis_index: usize) -> f32 {
         0 => p.z,
         1 => p.y,
         _ => p.x,
+    }
+}
+
+/// Returns `Some((min, max))` when the color mode is scalar and auto-range is off,
+/// otherwise `None` so `recolor` will auto-detect the range from the data.
+fn scalar_range_opt(
+    mode: &ColorMode,
+    auto: bool,
+    min: f32,
+    max: f32,
+) -> Option<(f32, f32)> {
+    if auto { return None; }
+    match mode {
+        ColorMode::Dpv(_) | ColorMode::Dps(_) => Some((min, max)),
+        _ => None,
     }
 }
 
@@ -716,27 +894,157 @@ impl eframe::App for TrxViewerApp {
                     sr.update_colors(&rs.queue, &data.colors);
                 }
             }
+            // Tube vertices embed colors — rebuild geometry so the new colors take effect.
+            if self.render_style == RenderStyle::Tubes {
+                self.indices_dirty = true;
+            }
+            // Bundle mesh vertex colors come from the color buffer; trigger rebuild.
+            if self.show_bundle_mesh {
+                self.bundle_mesh_dirty_at = Some(std::time::Instant::now());
+            }
             self.colors_dirty = false;
         }
 
-        // Update index buffer if any filter changed
+        // Update index buffer (and tube geometry) if any filter changed
         if self.indices_dirty {
             if let (Some(data), Some(rs)) = (&self.trx_data, frame.wgpu_render_state()) {
-                let indices = data.build_index_buffer(
-                    &self.group_visible,
-                    self.max_streamlines,
-                    &self.streamline_order,
-                    self.sphere_query_result.as_ref(),
-                    self.surface_query_result.as_ref(),
-                );
-                let mut renderer = rs.renderer.write();
-                if let Some(sr) = renderer.callback_resources.get_mut::<StreamlineResources>() {
-                    sr.update_indices(&rs.device, &rs.queue, &indices);
+                if self.render_style == RenderStyle::Tubes {
+                    let selected = data.filtered_streamline_indices(
+                        &self.group_visible,
+                        self.max_streamlines,
+                        &self.streamline_order,
+                        self.sphere_query_result.as_ref(),
+                        self.surface_query_result.as_ref(),
+                    );
+                    let (tube_verts, tube_indices) = data.build_tube_vertices(&selected);
+                    let mut renderer = rs.renderer.write();
+                    if let Some(sr) = renderer.callback_resources.get_mut::<StreamlineResources>() {
+                        sr.update_tube_geometry(&rs.device, &tube_verts, &tube_indices);
+                        // Keep line indices up to date too (used when switching back)
+                        let line_indices = data.build_index_buffer(
+                            &self.group_visible, self.max_streamlines,
+                            &self.streamline_order,
+                            self.sphere_query_result.as_ref(),
+                            self.surface_query_result.as_ref(),
+                        );
+                        sr.update_indices(&rs.device, &rs.queue, &line_indices);
+                    }
+                } else {
+                    let indices = data.build_index_buffer(
+                        &self.group_visible,
+                        self.max_streamlines,
+                        &self.streamline_order,
+                        self.sphere_query_result.as_ref(),
+                        self.surface_query_result.as_ref(),
+                    );
+                    let mut renderer = rs.renderer.write();
+                    if let Some(sr) = renderer.callback_resources.get_mut::<StreamlineResources>() {
+                        sr.update_indices(&rs.device, &rs.queue, &indices);
+                    }
                 }
             }
             self.indices_dirty = false;
             self.selection_revision = self.selection_revision.wrapping_add(1);
             self.surface_projection_dirty = true;
+            // Bundle mesh rebuilds when selection changes (not needed for All source).
+            if self.show_bundle_mesh
+                && self.bundle_mesh_source != BundleMeshSource::All
+            {
+                self.bundle_mesh_dirty_at = Some(std::time::Instant::now());
+            }
+        }
+
+        // ── Bundle mesh: check debounce + receive completed mesh ──────────────
+        if let Some(t) = self.bundle_mesh_dirty_at {
+            if t.elapsed() >= std::time::Duration::from_millis(150) {
+                self.bundle_mesh_dirty_at = None;
+                if self.show_bundle_mesh {
+                    if let Some(data) = &self.trx_data {
+                        let voxel_size = self.bundle_mesh_voxel_size;
+                        let threshold  = self.bundle_mesh_threshold;
+                        let smooth     = self.bundle_mesh_smooth;
+                        let (tx, rx) = std::sync::mpsc::channel();
+                        self.bundle_mesh_pending = Some(rx);
+                        let egui_ctx = ctx.clone();
+
+                        match self.bundle_mesh_source {
+                            BundleMeshSource::All => {
+                                // All vertex positions + current colors.
+                                let positions = data.positions.clone();
+                                let colors    = data.colors.clone();
+                                std::thread::spawn(move || {
+                                    let mut out = Vec::new();
+                                    if let Some(m) = build_bundle_mesh(&positions, &colors, voxel_size, threshold, smooth) {
+                                        out.push((m, "all".to_string()));
+                                    }
+                                    let _ = tx.send(out);
+                                    egui_ctx.request_repaint();
+                                });
+                            }
+                            BundleMeshSource::Selection => {
+                                let selected = data.filtered_streamline_indices(
+                                    &self.group_visible,
+                                    self.max_streamlines,
+                                    &self.streamline_order,
+                                    self.sphere_query_result.as_ref(),
+                                    self.surface_query_result.as_ref(),
+                                );
+                                let (positions, colors) = data.selected_vertex_data(&selected);
+                                std::thread::spawn(move || {
+                                    let mut out = Vec::new();
+                                    if let Some(m) = build_bundle_mesh(&positions, &colors, voxel_size, threshold, smooth) {
+                                        out.push((m, "selection".to_string()));
+                                    }
+                                    let _ = tx.send(out);
+                                    egui_ctx.request_repaint();
+                                });
+                            }
+                            BundleMeshSource::PerGroup => {
+                                // One mesh per group, using only visible groups.
+                                let group_data: Vec<(String, Vec<[f32;3]>, Vec<[f32;4]>)> =
+                                    data.groups.iter()
+                                        .enumerate()
+                                        .filter(|(i, _)| self.group_visible.get(*i).copied().unwrap_or(true))
+                                        .map(|(_, (name, members))| {
+                                            let (pos, col) = data.selected_vertex_data(members);
+                                            (name.clone(), pos, col)
+                                        })
+                                        .collect();
+                                std::thread::spawn(move || {
+                                    let out: Vec<(BundleMesh, String)> = group_data
+                                        .into_iter()
+                                        .filter_map(|(name, pos, col)| {
+                                            build_bundle_mesh(&pos, &col, voxel_size, threshold, smooth)
+                                                .map(|m| (m, name))
+                                        })
+                                        .collect();
+                                    let _ = tx.send(out);
+                                    egui_ctx.request_repaint();
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+            ctx.request_repaint_after(std::time::Duration::from_millis(50));
+        }
+
+        if let Some(rx) = &self.bundle_mesh_pending {
+            if let Ok(meshes) = rx.try_recv() {
+                self.bundle_mesh_pending = None;
+                if let Some(rs) = frame.wgpu_render_state() {
+                    let mut renderer = rs.renderer.write();
+                    if let Some(mr) = renderer.callback_resources.get_mut::<MeshResources>() {
+                        if meshes.is_empty() {
+                            mr.clear_bundle_mesh();
+                            self.bundle_meshes_cpu.clear();
+                        } else {
+                            mr.set_bundle_meshes(&rs.device, &meshes);
+                            self.bundle_meshes_cpu = meshes.into_iter().map(|(m, _)| m).collect();
+                        }
+                    }
+                }
+            }
         }
 
         if self.surface_projection_dirty {
@@ -1146,7 +1454,18 @@ impl eframe::App for TrxViewerApp {
 
                         self.color_mode = new_mode.clone();
                         if let Some(data) = &mut self.trx_data {
-                            data.recolor(&new_mode);
+                            // For scalar modes, set up auto range from data
+                            if self.scalar_auto_range {
+                                if let Some((lo, hi)) = data.scalar_range_for_mode(&new_mode) {
+                                    self.scalar_range_min = lo;
+                                    self.scalar_range_max = hi;
+                                }
+                            }
+                            let range = scalar_range_opt(
+                                &new_mode, self.scalar_auto_range,
+                                self.scalar_range_min, self.scalar_range_max,
+                            );
+                            data.recolor(&new_mode, range);
                         }
                         self.colors_dirty = true;
                     }
@@ -1158,12 +1477,206 @@ impl eframe::App for TrxViewerApp {
                             self.uniform_color = c;
                             self.color_mode = ColorMode::Uniform(c);
                             if let Some(data) = &mut self.trx_data {
-                                data.recolor(&ColorMode::Uniform(c));
+                                data.recolor(&ColorMode::Uniform(c), None);
                             }
                             self.colors_dirty = true;
                         }
                     }
 
+                    // ── Colorbar (DPV / DPS only) ──────────────────────────
+                    let is_scalar = matches!(self.color_mode, ColorMode::Dpv(_) | ColorMode::Dps(_));
+                    if is_scalar {
+                        ui.add_space(4.0);
+
+                        // Draw gradient strip
+                        let bar_w = ui.available_width();
+                        let bar_h = 14.0;
+                        let (bar_rect, _) = ui.allocate_exact_size(
+                            egui::vec2(bar_w, bar_h), egui::Sense::hover(),
+                        );
+                        let painter = ui.painter_at(bar_rect);
+                        let n = 64usize;
+                        let sw = bar_w / n as f32;
+                        for i in 0..n {
+                            let t = i as f32 / (n - 1) as f32;
+                            let [r, g, b, _] = colormap_bwr(t);
+                            let col = egui::Color32::from_rgb(
+                                (r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8,
+                            );
+                            painter.rect_filled(
+                                egui::Rect::from_min_size(
+                                    egui::pos2(bar_rect.left() + i as f32 * sw, bar_rect.top()),
+                                    egui::vec2(sw + 1.0, bar_h),
+                                ),
+                                0.0, col,
+                            );
+                        }
+
+                        // Min / max labels and editable range
+                        let mut range_changed = false;
+                        ui.horizontal(|ui| {
+                            if ui.checkbox(&mut self.scalar_auto_range, "Auto").changed()
+                                && self.scalar_auto_range
+                            {
+                                // Re-compute range from data when re-enabling auto
+                                if let Some(data) = &self.trx_data {
+                                    if let Some((lo, hi)) = data.scalar_range_for_mode(&self.color_mode) {
+                                        self.scalar_range_min = lo;
+                                        self.scalar_range_max = hi;
+                                        range_changed = true;
+                                    }
+                                }
+                            }
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Min");
+                            let resp = ui.add_enabled(
+                                !self.scalar_auto_range,
+                                egui::DragValue::new(&mut self.scalar_range_min).speed(0.01),
+                            );
+                            if resp.changed() { range_changed = true; }
+                            ui.label("Max");
+                            let resp = ui.add_enabled(
+                                !self.scalar_auto_range,
+                                egui::DragValue::new(&mut self.scalar_range_max).speed(0.01),
+                            );
+                            if resp.changed() { range_changed = true; }
+                        });
+
+                        if range_changed {
+                            let range = Some((self.scalar_range_min, self.scalar_range_max));
+                            let mode = self.color_mode.clone();
+                            if let Some(data) = &mut self.trx_data {
+                                data.recolor(&mode, range);
+                            }
+                            self.colors_dirty = true;
+                        }
+                    }
+
+                    ui.separator();
+                }
+
+                // ── Render style ──
+                if self.has_streamlines {
+                    ui.label("Render Style");
+                    let styles = [
+                        (RenderStyle::Flat,        "Flat lines"),
+                        (RenderStyle::Illuminated, "Illuminated"),
+                        (RenderStyle::Tubes,       "Tube impostors"),
+                        (RenderStyle::DepthCue,    "Depth cue"),
+                    ];
+                    let current_label = styles.iter()
+                        .find(|(s, _)| *s == self.render_style)
+                        .map(|(_, l)| *l)
+                        .unwrap_or("Flat lines");
+
+                    egui::ComboBox::from_id_salt("render_style")
+                        .selected_text(current_label)
+                        .show_ui(ui, |ui| {
+                            for (style, label) in &styles {
+                                if ui.selectable_value(&mut self.render_style, *style, *label).changed() {
+                                    // Switching to/from Tubes requires geometry rebuild
+                                    self.indices_dirty = true;
+                                }
+                            }
+                        });
+
+                    if self.render_style == RenderStyle::Tubes {
+                        ui.horizontal(|ui| {
+                            ui.label("Radius (mm):");
+                            if ui.add(egui::Slider::new(&mut self.tube_radius, 0.1..=3.0).step_by(0.05)).changed() {
+                                self.indices_dirty = true;
+                            }
+                        });
+                    }
+
+                    ui.separator();
+                }
+
+                // ── Bundle surface mesh ───────────────────────────────────
+                if self.has_streamlines {
+                    ui.label("Bundle Surface Mesh");
+                    let mut rebuild = false;
+                    let mesh_toggled = ui.checkbox(&mut self.show_bundle_mesh, "Show surface").changed();
+                    if mesh_toggled {
+                        if self.show_bundle_mesh {
+                            rebuild = true;
+                        } else {
+                            if let Some(rs) = frame.wgpu_render_state() {
+                                if let Some(mr) = rs.renderer.write()
+                                    .callback_resources.get_mut::<MeshResources>()
+                                {
+                                    mr.clear_bundle_mesh();
+                                    self.bundle_meshes_cpu.clear();
+                                }
+                            }
+                        }
+                    }
+
+                    if self.show_bundle_mesh {
+                        // Source selector
+                        let src_label = match self.bundle_mesh_source {
+                            BundleMeshSource::All       => "All streamlines",
+                            BundleMeshSource::Selection => "Current selection",
+                            BundleMeshSource::PerGroup  => "Per group",
+                        };
+                        egui::ComboBox::from_id_salt("bundle_src")
+                            .selected_text(src_label)
+                            .show_ui(ui, |ui| {
+                                for (variant, label) in [
+                                    (BundleMeshSource::All,       "All streamlines"),
+                                    (BundleMeshSource::Selection, "Current selection"),
+                                    (BundleMeshSource::PerGroup,  "Per group"),
+                                ] {
+                                    if ui.selectable_value(&mut self.bundle_mesh_source, variant, label).changed() {
+                                        rebuild = true;
+                                    }
+                                }
+                            });
+
+                        ui.horizontal(|ui| {
+                            ui.label("Voxel (mm):");
+                            rebuild |= ui.add(
+                                egui::Slider::new(&mut self.bundle_mesh_voxel_size, 0.5..=10.0).step_by(0.5)
+                            ).changed();
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Threshold:");
+                            rebuild |= ui.add(
+                                egui::Slider::new(&mut self.bundle_mesh_threshold, 1.0..=50.0).step_by(1.0)
+                            ).changed();
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Smooth (σ):");
+                            rebuild |= ui.add(
+                                egui::Slider::new(&mut self.bundle_mesh_smooth, 0.0..=4.0).step_by(0.25)
+                            ).changed();
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Opacity:");
+                            ui.add(egui::Slider::new(&mut self.bundle_mesh_opacity, 0.0..=1.0));
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Ambient:");
+                            ui.add(egui::Slider::new(&mut self.bundle_mesh_ambient, 0.0..=1.0));
+                        });
+
+                        if rebuild {
+                            self.bundle_mesh_dirty_at = Some(std::time::Instant::now());
+                        }
+
+                        if ui.button("Rebuild now").clicked() {
+                            self.bundle_mesh_dirty_at = Some(
+                                std::time::Instant::now()
+                                    - std::time::Duration::from_millis(200),
+                            );
+                        }
+
+                        let building = self.bundle_mesh_dirty_at.is_some() || self.bundle_mesh_pending.is_some();
+                        ui.add_enabled(false, egui::Label::new(
+                            egui::RichText::new(if building { "Building…" } else { " " }).small()
+                        ));
+                    }
                     ui.separator();
                 }
 
@@ -1299,6 +1812,7 @@ impl eframe::App for TrxViewerApp {
                         }
                     }
 
+
                     ui.separator();
                 }
 
@@ -1422,9 +1936,15 @@ impl eframe::App for TrxViewerApp {
                     has_streamlines: self.has_streamlines,
                     show_streamlines: self.show_streamlines,
                     has_slices: self.has_slices,
+                    slice_visible: self.slice_visible,
                     window_center: self.window_center,
                     window_width: self.window_width,
                     surface_draws,
+                    render_style: self.render_style,
+                    tube_radius: self.tube_radius,
+                    show_bundle_mesh: self.show_bundle_mesh,
+                    bundle_mesh_opacity: self.bundle_mesh_opacity,
+                    bundle_mesh_ambient: self.bundle_mesh_ambient,
                 },
             ));
 
@@ -1441,10 +1961,15 @@ impl eframe::App for TrxViewerApp {
             let slice_height = (bottom_height - ui.spacing().item_spacing.y - 18.0).max(10.0);
 
             ui.horizontal(|ui| {
-                let labels = ["Axial", "Coronal", "Sagittal"];
+                let axis_names  = ["Axial",   "Coronal",  "Sagittal"];
+                let axis_labels = ["Z",       "Y",        "X"];
                 for i in 0..3 {
                     ui.vertical(|ui| {
-                        ui.label(labels[i]);
+                        let pos_mm = self.slice_world_position(i);
+                        ui.horizontal(|ui| {
+                            ui.checkbox(&mut self.slice_visible[i], "");
+                            ui.label(format!("{} ({} = {:.1} mm)", axis_names[i], axis_labels[i], pos_mm));
+                        });
                         let (rect, response) = ui.allocate_exact_size(
                             egui::vec2(slice_width, slice_height),
                             egui::Sense::click_and_drag(),
@@ -1468,6 +1993,18 @@ impl eframe::App for TrxViewerApp {
                                         self.slice_indices[i] = new_idx;
                                         self.slices_dirty = true;
                                     }
+                                } else {
+                                    // No NIfTI: scroll moves the world-space slab position.
+                                    let step = self.volume_extent * 0.005;
+                                    let delta = if scroll > 0.0 { step } else { -step };
+                                    let half = self.volume_extent * 0.6;
+                                    let center = match i {
+                                        0 => self.volume_center.z,
+                                        1 => self.volume_center.y,
+                                        _ => self.volume_center.x,
+                                    };
+                                    self.slice_world_offsets[i] = (self.slice_world_offsets[i] + delta)
+                                        .clamp(center - half, center + half);
                                 }
                             }
                         }
@@ -1522,10 +2059,10 @@ impl eframe::App for TrxViewerApp {
                             },
                         ));
 
-                        // Draw crosshairs showing other slice positions
-                        if self.has_slices {
-                            self.draw_crosshairs(ui, rect, i, vp_slice);
-                        }
+                        // Draw crosshairs showing the other two slice positions.
+                        // Drawn whenever any data is loaded so the user can see the
+                        // slice plane even without a NIfTI background.
+                        self.draw_crosshairs(ui, rect, i, vp_slice);
 
                         // Draw anatomical orientation labels
                         self.draw_orientation_labels(ui, rect, i, vp_slice);
@@ -1776,9 +2313,15 @@ struct Scene3DCallback {
     has_streamlines: bool,
     show_streamlines: bool,
     has_slices: bool,
+    slice_visible: [bool; 3],
     window_center: f32,
     window_width: f32,
     surface_draws: Vec<(usize, MeshDrawStyle)>,
+    render_style: RenderStyle,
+    tube_radius: f32,
+    show_bundle_mesh: bool,
+    bundle_mesh_opacity: f32,
+    bundle_mesh_ambient: f32,
 }
 
 impl egui_wgpu::CallbackTrait for Scene3DCallback {
@@ -1791,7 +2334,10 @@ impl egui_wgpu::CallbackTrait for Scene3DCallback {
         callback_resources: &mut egui_wgpu::CallbackResources,
     ) -> Vec<wgpu::CommandBuffer> {
         if let Some(res) = callback_resources.get_mut::<StreamlineResources>() {
-            res.update_uniforms(queue, 0, self.view_proj, 3, 0.0, 0.0);
+            // depth_cue mode reuses tube_radius field as depth_far
+            let aux = if self.render_style == RenderStyle::DepthCue { 300.0 } else { self.tube_radius };
+            res.update_uniforms(queue, 0, self.view_proj, self.camera_pos,
+                self.render_style as u32, 3, 0.0, 0.0, aux);
         }
         if let Some(res) = callback_resources.get_mut::<SliceResources>() {
             res.update_uniforms(queue, 0, self.view_proj, self.window_center, self.window_width);
@@ -1805,6 +2351,15 @@ impl egui_wgpu::CallbackTrait for Scene3DCallback {
                     self.view_proj,
                     style,
                     self.camera_pos,
+                );
+            }
+            if self.show_bundle_mesh {
+                res.update_bundle_uniforms(
+                    queue,
+                    self.view_proj,
+                    self.camera_pos,
+                    self.bundle_mesh_opacity,
+                    self.bundle_mesh_ambient,
                 );
             }
         }
@@ -1839,6 +2394,7 @@ impl egui_wgpu::CallbackTrait for Scene3DCallback {
                     wgpu::IndexFormat::Uint16,
                 );
                 for i in 0..3 {
+                    if !self.slice_visible[i] { continue; }
                     render_pass.set_vertex_buffer(0, sr.quad_buffers[i].slice(..));
                     render_pass.draw_indexed(0..6, 0, 0..1);
                 }
@@ -1847,21 +2403,31 @@ impl egui_wgpu::CallbackTrait for Scene3DCallback {
 
         if self.has_streamlines && self.show_streamlines {
             if let Some(sr) = callback_resources.get::<StreamlineResources>() {
-                render_pass.set_pipeline(&sr.pipeline);
                 render_pass.set_bind_group(0, &sr.bind_groups[0], &[]);
-                render_pass.set_vertex_buffer(0, sr.position_buffer.slice(..));
-                render_pass.set_vertex_buffer(1, sr.color_buffer.slice(..));
-                render_pass.set_index_buffer(
-                    sr.index_buffer.slice(..),
-                    wgpu::IndexFormat::Uint32,
-                );
-                render_pass.draw_indexed(0..sr.num_indices, 0, 0..1);
+                if self.render_style == RenderStyle::Tubes {
+                    if let (Some(tvb), Some(tib)) = (&sr.tube_vertex_buffer, &sr.tube_index_buffer) {
+                        render_pass.set_pipeline(&sr.tube_pipeline);
+                        render_pass.set_vertex_buffer(0, tvb.slice(..));
+                        render_pass.set_index_buffer(tib.slice(..), wgpu::IndexFormat::Uint32);
+                        render_pass.draw_indexed(0..sr.num_tube_indices, 0, 0..1);
+                    }
+                } else {
+                    render_pass.set_pipeline(&sr.pipeline);
+                    render_pass.set_vertex_buffer(0, sr.position_buffer.slice(..));
+                    render_pass.set_vertex_buffer(1, sr.color_buffer.slice(..));
+                    render_pass.set_vertex_buffer(2, sr.tangent_buffer.slice(..));
+                    render_pass.set_index_buffer(sr.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                    render_pass.draw_indexed(0..sr.num_indices, 0, 0..1);
+                }
             }
         }
 
-        if !self.surface_draws.is_empty() {
-            if let Some(mr) = callback_resources.get::<MeshResources>() {
+        if let Some(mr) = callback_resources.get::<MeshResources>() {
+            if !self.surface_draws.is_empty() {
                 mr.paint(render_pass, 0, &self.surface_draws);
+            }
+            if self.show_bundle_mesh {
+                mr.paint_bundle(render_pass);
             }
         }
     }
@@ -1895,13 +2461,17 @@ impl egui_wgpu::CallbackTrait for SliceViewCallback {
             res.update_uniforms(queue, self.bind_group_index, self.view_proj, self.window_center, self.window_width);
         }
         if let Some(res) = callback_resources.get_mut::<StreamlineResources>() {
+            // Slice views always render flat lines regardless of 3D render style.
             res.update_uniforms(
                 queue,
                 self.bind_group_index,
                 self.view_proj,
+                glam::Vec3::ZERO,
+                0, // flat
                 self.slab_axis,
                 self.slab_min,
                 self.slab_max,
+                0.5,
             );
         }
         Vec::new()
@@ -1945,10 +2515,8 @@ impl egui_wgpu::CallbackTrait for SliceViewCallback {
                 render_pass.set_bind_group(0, &sr.bind_groups[self.bind_group_index], &[]);
                 render_pass.set_vertex_buffer(0, sr.position_buffer.slice(..));
                 render_pass.set_vertex_buffer(1, sr.color_buffer.slice(..));
-                render_pass.set_index_buffer(
-                    sr.index_buffer.slice(..),
-                    wgpu::IndexFormat::Uint32,
-                );
+                render_pass.set_vertex_buffer(2, sr.tangent_buffer.slice(..));
+                render_pass.set_index_buffer(sr.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
                 render_pass.draw_indexed(0..sr.num_indices, 0, 0..1);
             }
         }
