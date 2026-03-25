@@ -83,6 +83,87 @@ pub struct TubeVertex {
     pub _pad: [f32; 2],
 }
 
+/// Tableau-20 palette (matplotlib `tab20`) as linear RGB floats [0, 1].
+/// Index matches the Python `tableau_20[i]` convention.
+const TABLEAU_20: [[f32; 3]; 20] = [
+    [0.122, 0.467, 0.706], // 0  blue
+    [0.682, 0.780, 0.910], // 1  light blue
+    [1.000, 0.498, 0.055], // 2  orange
+    [1.000, 0.733, 0.471], // 3  light orange
+    [0.173, 0.627, 0.173], // 4  green
+    [0.596, 0.875, 0.541], // 5  light green
+    [0.839, 0.153, 0.157], // 6  red
+    [1.000, 0.596, 0.588], // 7  light red / salmon
+    [0.580, 0.404, 0.741], // 8  purple
+    [0.773, 0.690, 0.835], // 9  light purple
+    [0.549, 0.337, 0.294], // 10 brown
+    [0.769, 0.612, 0.580], // 11 light brown
+    [0.890, 0.467, 0.761], // 12 pink
+    [0.969, 0.714, 0.824], // 13 light pink
+    [0.498, 0.498, 0.498], // 14 grey
+    [0.780, 0.780, 0.780], // 15 light grey
+    [0.737, 0.741, 0.133], // 16 olive / yellow-green
+    [0.859, 0.859, 0.553], // 17 light yellow-green
+    [0.090, 0.745, 0.812], // 18 cyan
+    [0.620, 0.855, 0.898], // 19 light cyan
+];
+
+/// Two extra colors used by `tableau_extension` in the Python COLOR_DICT.
+const TABLEAU_EXTENSION: [[f32; 3]; 2] = [
+    [0.400, 0.761, 0.647], // 0  teal
+    [0.988, 0.553, 0.384], // 1  coral
+];
+
+/// Return the reference color for a well-known bundle group name, or `None` if
+/// the name is not recognised.  Colors are [R, G, B, A] linear floats in [0, 1].
+fn group_name_color(name: &str) -> Option<[f32; 4]> {
+    let t = |i: usize| -> [f32; 4] {
+        let [r, g, b] = TABLEAU_20[i];
+        [r, g, b, 1.0]
+    };
+    let e = |i: usize| -> [f32; 4] {
+        let [r, g, b] = TABLEAU_EXTENSION[i];
+        [r, g, b, 1.0]
+    };
+    let rgb = |r: f32, g: f32, b: f32| -> [f32; 4] { [r, g, b, 1.0] };
+
+    match name {
+        "Left Anterior Thalamic"         | "C_L"              => Some(t(0)),
+        "Right Anterior Thalamic"        | "C_R"              => Some(t(1)),
+        "Left Corticospinal"                                   => Some(t(2)),
+        "Right Corticospinal"                                  => Some(t(3)),
+        "Left Cingulum Cingulate"        | "MCP"              => Some(t(4)),
+        "Right Cingulum Cingulate"       | "CCMid"            => Some(t(5)),
+        "Left Posterior Arcuate"                               => Some(t(6)),
+        "Right Posterior Arcuate"                              => Some(t(7)),
+        "Forceps Minor"                  | "CC_ForcepsMinor"  => Some(t(8)),
+        "Forceps Major"                  | "CC_ForcepsMajor"  => Some(t(9)),
+        "Left Inferior Fronto-occipital" | "IFOF_L"           => Some(t(10)),
+        "Right Inferior Fronto-occipital"| "IFOF_R"           => Some(t(11)),
+        "Left Inferior Longitudinal"     | "F_L"              => Some(t(12)),
+        "Right Inferior Longitudinal"    | "F_R"              => Some(t(13)),
+        "Left Superior Longitudinal"                           => Some(t(14)),
+        "Right Superior Longitudinal"                          => Some(t(15)),
+        "Left Uncinate"                  | "UF_L"             => Some(t(16)),
+        "Right Uncinate"                 | "UF_R"             => Some(t(17)),
+        "Left Arcuate"                   | "AF_L"             => Some(t(18)),
+        "Right Arcuate"                  | "AF_R"             => Some(t(19)),
+        "Left Vertical Occipital"                              => Some(e(0)),
+        "Right Vertical Occipital"                             => Some(e(1)),
+        "median"                                               => Some(t(6)),
+        // Paul Tol's palette for callosal bundles
+        "Callosum Orbital"                                     => Some(rgb(0.20, 0.13, 0.53)),
+        "Callosum Anterior Frontal"                            => Some(rgb(0.07, 0.47, 0.20)),
+        "Callosum Superior Frontal"                            => Some(rgb(0.27, 0.67, 0.60)),
+        "Callosum Motor"                                       => Some(rgb(0.53, 0.80, 0.93)),
+        "Callosum Superior Parietal"                           => Some(rgb(0.87, 0.80, 0.47)),
+        "Callosum Posterior Parietal"                          => Some(rgb(0.80, 0.40, 0.47)),
+        "Callosum Occipital"                                   => Some(rgb(0.67, 0.27, 0.60)),
+        "Callosum Temporal"                                    => Some(rgb(0.53, 0.13, 0.33)),
+        _                                                      => None,
+    }
+}
+
 impl TrxGpuData {
     /// Load a TRX file and produce GPU-ready data with direction-RGB coloring.
     pub fn load(path: &Path) -> anyhow::Result<Self> {
@@ -412,7 +493,7 @@ impl TrxGpuData {
     fn compute_group_colors(&self) -> Vec<[f32; 4]> {
         let mut colors = vec![[0.5f32, 0.5, 0.5, 1.0]; self.nb_vertices];
 
-        // Distinct colors for each group
+        // Fallback palette when group name is not in the reference dict.
         let palette: &[[f32; 4]] = &[
             [1.0, 0.2, 0.2, 1.0], // red
             [0.2, 0.7, 1.0, 1.0], // blue
@@ -424,8 +505,8 @@ impl TrxGpuData {
             [0.3, 1.0, 0.8, 1.0], // cyan
         ];
 
-        for (gi, (_, members)) in self.groups.iter().enumerate() {
-            let color = palette[gi % palette.len()];
+        for (gi, (name, members)) in self.groups.iter().enumerate() {
+            let color = group_name_color(name).unwrap_or(palette[gi % palette.len()]);
             for &streamline_idx in members {
                 let si = streamline_idx as usize;
                 if si + 1 < self.offsets.len() {

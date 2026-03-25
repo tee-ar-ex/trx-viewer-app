@@ -54,7 +54,7 @@ impl super::super::TrxViewerApp {
                             .show_header(ui, |ui| {
                                 ui.label(&trx_name);
                             })
-                            .body(ui, |ui| {
+                            .body(|ui| {
                                 self.show_trx_section(ui, frame, trx_idx);
                             });
                         }
@@ -91,7 +91,7 @@ impl super::super::TrxViewerApp {
             .show_header(ui, |ui| {
                 ui.label(&nf.name);
             })
-            .body(ui, |ui| {
+            .body(|ui| {
                     ui.small(format!(
                         "Dims: {}x{}x{}",
                         nf.volume.dims[0], nf.volume.dims[1], nf.volume.dims[2]
