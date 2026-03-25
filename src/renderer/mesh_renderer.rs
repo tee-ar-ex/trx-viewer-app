@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use wgpu::util::DeviceExt;
 
 use crate::data::bundle_mesh::{BundleMesh, BundleMeshVertex};
@@ -68,9 +70,9 @@ struct BundleGpuSurface {
 pub struct MeshResources {
     pub pipeline: wgpu::RenderPipeline,
     surfaces: Vec<GpuSurface>,
-    // Bundle surfaces — one per "slot" (all, selection, or one per group)
+    // Bundle surfaces — keyed by file_id, one Vec per TRX file
     pub bundle_pipeline: wgpu::RenderPipeline,
-    bundle_surfaces: Vec<BundleGpuSurface>,
+    bundle_surfaces: HashMap<usize, Vec<BundleGpuSurface>>,
 }
 
 struct GpuSurface {
@@ -149,7 +151,7 @@ impl MeshResources {
             },
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: wgpu::TextureFormat::Depth32Float,
-                depth_write_enabled: true,
+                depth_write_enabled: false,
                 depth_compare: wgpu::CompareFunction::LessEqual,
                 stencil: wgpu::StencilState::default(),
                 bias: wgpu::DepthBiasState::default(),
@@ -246,7 +248,7 @@ impl MeshResources {
             pipeline,
             surfaces: Vec::new(),
             bundle_pipeline,
-            bundle_surfaces: Vec::new(),
+            bundle_surfaces: HashMap::new(),
         }
     }
 
@@ -442,58 +444,61 @@ impl MeshResources {
         }
     }
 
-    /// Replace all bundle surfaces with freshly-built meshes.
+    /// Replace the bundle surfaces for one TRX file.
     /// `meshes` is a slice of `(mesh, label)` pairs — one entry per source
     /// (e.g. one for all streamlines, or one per group).
     pub fn set_bundle_meshes(
         &mut self,
+        file_id: usize,
         device: &wgpu::Device,
         meshes: &[(BundleMesh, String)],
     ) {
-        self.bundle_surfaces = meshes
+        let surfaces = meshes
             .iter()
             .map(|(m, label)| self.make_bundle_gpu_surface(device, m, label))
             .collect();
+        self.bundle_surfaces.insert(file_id, surfaces);
     }
 
-    /// Update per-frame uniforms for every bundle surface (shared params).
+    /// Update per-frame uniforms for one TRX file's bundle surfaces.
     pub fn update_bundle_uniforms(
         &self,
+        file_id:    usize,
         queue:      &wgpu::Queue,
         view_proj:  glam::Mat4,
         camera_pos: glam::Vec3,
         opacity:    f32,
         ambient:    f32,
     ) {
-        let uniforms = BundleUniforms {
-            view_proj:  view_proj.to_cols_array_2d(),
-            camera_pos: camera_pos.into(),
-            opacity,
-            ambient,
-            _pad: [0.0; 3],
-        };
-        for bs in &self.bundle_surfaces {
-            queue.write_buffer(&bs.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
+        if let Some(surfaces) = self.bundle_surfaces.get(&file_id) {
+            let uniforms = BundleUniforms {
+                view_proj:  view_proj.to_cols_array_2d(),
+                camera_pos: camera_pos.into(),
+                opacity,
+                ambient,
+                _pad: [0.0; 3],
+            };
+            for bs in surfaces {
+                queue.write_buffer(&bs.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
+            }
         }
     }
 
-    /// Draw all bundle surfaces.
+    /// Draw all bundle surfaces across all TRX files.
     pub fn paint_bundle(&self, render_pass: &mut wgpu::RenderPass<'static>) {
         if self.bundle_surfaces.is_empty() { return; }
         render_pass.set_pipeline(&self.bundle_pipeline);
-        for bs in &self.bundle_surfaces {
-            render_pass.set_bind_group(0, &bs.bind_group, &[]);
-            render_pass.set_vertex_buffer(0, bs.vertex_buffer.slice(..));
-            render_pass.set_index_buffer(bs.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-            render_pass.draw_indexed(0..bs.num_indices, 0, 0..1);
+        for surfaces in self.bundle_surfaces.values() {
+            for bs in surfaces {
+                render_pass.set_bind_group(0, &bs.bind_group, &[]);
+                render_pass.set_vertex_buffer(0, bs.vertex_buffer.slice(..));
+                render_pass.set_index_buffer(bs.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                render_pass.draw_indexed(0..bs.num_indices, 0, 0..1);
+            }
         }
     }
 
-    pub fn has_bundle_mesh(&self) -> bool {
-        !self.bundle_surfaces.is_empty()
-    }
-
-    pub fn clear_bundle_mesh(&mut self) {
-        self.bundle_surfaces.clear();
+    pub fn clear_bundle_mesh(&mut self, file_id: usize) {
+        self.bundle_surfaces.remove(&file_id);
     }
 }

@@ -2,6 +2,11 @@ use wgpu::util::DeviceExt;
 
 use crate::data::trx_data::{TrxGpuData, TubeVertex};
 
+/// Holds StreamlineResources for all loaded TRX files, keyed by FileId.
+pub struct AllStreamlineResources {
+    pub entries: Vec<(usize, StreamlineResources)>,
+}
+
 /// GPU resources for streamline rendering.
 pub struct StreamlineResources {
     /// Line-based pipeline (Flat / Illuminated / DepthCue modes). 3D viewport.
@@ -10,8 +15,6 @@ pub struct StreamlineResources {
     pub slice_pipeline: wgpu::RenderPipeline,
     /// Tube impostor pipeline. 3D viewport.
     pub tube_pipeline: wgpu::RenderPipeline,
-    /// Tube impostor pipeline for slice views (depth Always).
-    pub tube_slice_pipeline: wgpu::RenderPipeline,
     pub position_buffer: wgpu::Buffer,
     pub color_buffer: wgpu::Buffer,
     pub tangent_buffer: wgpu::Buffer,
@@ -169,14 +172,8 @@ impl StreamlineResources {
 
         let tube_pipeline = Self::make_tube_pipeline(
             device, &pipeline_layout, &tube_shader, target_format,
-            &[tube_layout.clone()],
-            wgpu::CompareFunction::Less, true,
-        );
-
-        let tube_slice_pipeline = Self::make_tube_pipeline(
-            device, &pipeline_layout, &tube_shader, target_format,
             &[tube_layout],
-            wgpu::CompareFunction::Always, false,
+            wgpu::CompareFunction::Less, true,
         );
 
         let position_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -207,7 +204,6 @@ impl StreamlineResources {
             pipeline,
             slice_pipeline,
             tube_pipeline,
-            tube_slice_pipeline,
             position_buffer,
             color_buffer,
             tangent_buffer,

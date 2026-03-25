@@ -67,13 +67,6 @@ pub struct TrxGpuData {
     pub aabbs: Vec<[f32; 6]>,
 }
 
-#[repr(C)]
-#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
-pub struct StreamlineVertex {
-    pub position: [f32; 3],
-    pub color: [f32; 4],
-}
-
 /// Per-corner vertex for tube impostor rendering.
 /// Each line segment expands to 4 of these (a billboard quad).
 #[repr(C)]
@@ -211,17 +204,6 @@ impl TrxGpuData {
         }
     }
 
-    /// Build interleaved vertex data from current positions + colors.
-    pub fn vertices(&self) -> Vec<StreamlineVertex> {
-        self.positions
-            .iter()
-            .zip(self.colors.iter())
-            .map(|(pos, col)| StreamlineVertex {
-                position: *pos,
-                color: *col,
-            })
-            .collect()
-    }
 
     /// Build index buffer applying all active filters: group visibility, max count,
     /// ordering (for random subsetting), and optional sphere query.

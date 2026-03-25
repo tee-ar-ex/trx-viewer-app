@@ -150,23 +150,6 @@ impl OrthoSliceCamera {
         rot * projection * view
     }
 
-    /// Handle drag, accounting for the in-plane rotation.
-    pub fn handle_drag(&mut self, delta_x: f32, delta_y: f32, viewport_width: f32) {
-        let scale = self.half_extent * 2.0 / viewport_width.max(1.0);
-        // Rotate the screen drag deltas into the pre-rotation camera frame
-        let cos_r = self.rotation.cos();
-        let sin_r = self.rotation.sin();
-        let rx = cos_r * delta_x + sin_r * delta_y;
-        let ry = -sin_r * delta_x + cos_r * delta_y;
-        self.center[0] -= rx * scale;
-        self.center[1] -= ry * scale;
-    }
-
-    pub fn handle_zoom(&mut self, delta: f32) {
-        self.half_extent *= 1.0 - delta * 0.1;
-        self.half_extent = self.half_extent.max(1.0);
-    }
-
     /// Convert a screen position to RAS+ world coordinates on the slice plane.
     pub fn screen_to_world(
         &self,

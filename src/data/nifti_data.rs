@@ -58,8 +58,6 @@ pub struct NiftiVolume {
     pub dims: [usize; 3],
     /// Voxel-to-RAS+ affine (4x4, column-major for glam).
     pub voxel_to_ras: Mat4,
-    /// Intensity range before normalization.
-    pub intensity_range: (f32, f32),
 }
 
 impl NiftiVolume {
@@ -134,7 +132,6 @@ impl NiftiVolume {
             data,
             dims,
             voxel_to_ras,
-            intensity_range: (min_val, max_val),
         })
     }
 

@@ -15,8 +15,8 @@ struct SliceUniforms {
     view_proj: [[f32; 4]; 4],
     window_center: f32,
     window_width: f32,
-    _pad0: f32,
-    _pad1: f32,
+    colormap: u32,    // 0=Grayscale, 1=Hot, 2=Cool, 3=RedYellow, 4=BlueLightblue
+    opacity: f32,     // alpha multiplier
 }
 
 #[derive(Clone, Copy)]
@@ -138,8 +138,8 @@ impl SliceResources {
             view_proj: glam::Mat4::IDENTITY.to_cols_array_2d(),
             window_center: 0.5,
             window_width: 1.0,
-            _pad0: 0.0,
-            _pad1: 0.0,
+            colormap: 0,
+            opacity: 1.0,
         };
 
         let labels = ["slice_3d", "slice_axial", "slice_coronal", "slice_sagittal"];
@@ -354,13 +354,15 @@ impl SliceResources {
         view_proj: glam::Mat4,
         window_center: f32,
         window_width: f32,
+        colormap: u32,
+        opacity: f32,
     ) {
         let uniforms = SliceUniforms {
             view_proj: view_proj.to_cols_array_2d(),
             window_center,
             window_width,
-            _pad0: 0.0,
-            _pad1: 0.0,
+            colormap,
+            opacity,
         };
         queue.write_buffer(
             &self.uniform_buffers[bind_group_index],
@@ -368,4 +370,10 @@ impl SliceResources {
             bytemuck::bytes_of(&uniforms),
         );
     }
+}
+
+/// Wrapper for multiple SliceResources (one per loaded NIfTI volume).
+/// Needed because egui_wgpu::CallbackResources is a TypeMap.
+pub struct AllSliceResources {
+    pub entries: Vec<(usize, SliceResources)>, // (file_id, resources)
 }
