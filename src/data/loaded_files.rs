@@ -1,42 +1,17 @@
-use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::data::bundle_mesh::BundleMesh;
 use crate::data::nifti_data::NiftiVolume;
-use crate::data::trx_data::{ColorMode, RenderStyle, TrxGpuData, TubeMeshVertex};
+use crate::data::trx_data::TrxGpuData;
+use trx_rs::{AnyTrxFile, Tractogram};
 
 pub type FileId = usize;
-pub type TubeBuildResult = (u64, Vec<TubeMeshVertex>, Vec<u32>);
 
-/// Source for the bundle surface mesh.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum BundleMeshSource {
-    /// All streamlines in the file.
-    All,
-    /// Currently filtered / visible selection.
-    Selection,
-    /// One mesh per TRX group.
-    PerGroup,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum BundleMeshColorMode {
-    StreamlineColor,
-    DirectionOrientation,
-    BoundaryField,
-    Constant,
-}
-
-impl BundleMeshColorMode {
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::StreamlineColor => "Streamline color",
-            Self::DirectionOrientation => "Direction orientation",
-            Self::BoundaryField => "Boundary glyph field",
-            Self::Constant => "Constant",
-        }
-    }
+#[derive(Clone)]
+pub enum StreamlineBacking {
+    Native(Arc<AnyTrxFile>),
+    Imported(Arc<Tractogram>),
+    Derived(Arc<Tractogram>),
 }
 
 /// All per-TRX-file state: data, rendering options, filters, bundle mesh, etc.
@@ -45,41 +20,10 @@ pub struct LoadedTrx {
     pub name: String,
     pub path: PathBuf,
     pub data: Arc<TrxGpuData>,
-    pub visible: bool,
-    pub color_mode: ColorMode,
-    pub render_style: RenderStyle,
-    pub tube_radius: f32,
-    pub tube_sides: u32,
-    pub group_visible: Vec<bool>,
-    pub max_streamlines: usize,
-    pub use_random_subset: bool,
-    pub streamline_order: Vec<u32>,
-    pub uniform_color: [f32; 4],
-    pub scalar_auto_range: bool,
-    pub scalar_range_min: f32,
-    pub scalar_range_max: f32,
-    pub colors_dirty: bool,
-    pub indices_dirty: bool,
-    pub tube_mesh_pending: Option<std::sync::mpsc::Receiver<TubeBuildResult>>,
-    pub tube_mesh_dirty_at: Option<std::time::Instant>,
-    pub tube_build_revision: u64,
-    pub index_build_pending: bool,
-    pub slab_half_width: f32,
-    pub show_bundle_mesh: bool,
-    pub bundle_mesh_source: BundleMeshSource,
-    pub bundle_mesh_color_mode: BundleMeshColorMode,
-    pub bundle_mesh_voxel_size: f32,
-    pub bundle_mesh_threshold: f32,
-    pub bundle_mesh_smooth: f32,
-    pub bundle_mesh_opacity: f32,
-    pub bundle_meshes_cpu: Vec<BundleMesh>,
-    pub bundle_mesh_pending: Option<std::sync::mpsc::Receiver<Vec<(BundleMesh, String)>>>,
-    pub bundle_mesh_dirty_at: Option<std::time::Instant>,
-    pub sphere_query_result: Option<HashSet<u32>>,
-    pub include_in_boundary_glyphs: bool,
+    pub backing: Option<StreamlineBacking>,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum VolumeColormap {
     Grayscale,
     Hot,

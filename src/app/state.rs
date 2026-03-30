@@ -1,15 +1,14 @@
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::{collections::HashSet, sync::mpsc};
+use std::sync::mpsc;
 
 use crate::data::gifti_data::GiftiSurfaceData;
+use crate::data::loaded_files::StreamlineBacking;
 use crate::data::nifti_data::NiftiVolume;
+use crate::data::parcellation_data::ParcellationVolume;
 use crate::data::trx_data::TrxGpuData;
 use crate::renderer::mesh_renderer::SurfaceColormap;
 use trx_rs::Format;
-
-// Re-export BundleMeshSource from its canonical location in data::loaded_files.
-pub use crate::data::loaded_files::BundleMeshSource;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum SceneLightingPreset {
@@ -86,6 +85,7 @@ impl Default for SceneLightingParams {
 }
 
 pub struct LoadedGiftiSurface {
+    pub id: usize,
     pub name: String,
     pub path: PathBuf,
     pub data: Arc<GiftiSurfaceData>,
@@ -97,19 +97,10 @@ pub struct LoadedGiftiSurface {
     pub map_opacity: f32,
     pub map_threshold: f32,
     pub surface_gloss: f32,
-    pub projection_mode: SurfaceProjectionMode,
-    pub projection_dps: Option<String>,
-    pub projection_depth_mm: f32,
     pub projection_colormap: SurfaceColormap,
     pub auto_range: bool,
     pub range_min: f32,
     pub range_max: f32,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
-pub enum SurfaceProjectionMode {
-    Density,
-    MeanDps,
 }
 
 pub struct PendingFileLoad {
@@ -141,23 +132,26 @@ impl ImportDialogState {
     }
 }
 
-pub struct SurfaceProjectionOutput {
-    pub surface_idx: usize,
-    pub scalars: Vec<f32>,
-    pub data_min: f32,
-    pub data_max: f32,
+pub struct LoadedStreamlineSource {
+    pub data: TrxGpuData,
+    pub backing: StreamlineBacking,
+}
+
+pub struct LoadedParcellationSource {
+    pub data: ParcellationVolume,
+    pub label_table_path: Option<PathBuf>,
 }
 
 pub enum WorkerMessage {
     TrxLoaded {
         job_id: u64,
         path: PathBuf,
-        result: Result<TrxGpuData, String>,
+        result: Result<LoadedStreamlineSource, String>,
     },
-    ImportedTractogramLoaded {
+    ImportedStreamlinesLoaded {
         job_id: u64,
         path: PathBuf,
-        result: Result<TrxGpuData, String>,
+        result: Result<LoadedStreamlineSource, String>,
     },
     NiftiLoaded {
         job_id: u64,
@@ -169,17 +163,10 @@ pub enum WorkerMessage {
         path: PathBuf,
         result: Result<GiftiSurfaceData, String>,
     },
-    StreamlineIndicesBuilt {
-        file_id: usize,
-        indices: Vec<u32>,
-    },
-    SurfaceQueryDone {
-        revision: u64,
-        result: Option<HashSet<u32>>,
-    },
-    SurfaceProjectionDone {
-        revision: u64,
-        outputs: Vec<SurfaceProjectionOutput>,
+    ParcellationLoaded {
+        job_id: u64,
+        path: PathBuf,
+        result: Result<LoadedParcellationSource, String>,
     },
 }
 

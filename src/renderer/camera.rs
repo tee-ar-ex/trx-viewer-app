@@ -42,6 +42,10 @@ impl OrbitCamera {
         self.center + Vec3::new(x, y, z)
     }
 
+    pub fn view_direction(&self) -> Vec3 {
+        (self.center - self.eye()).normalize_or_zero()
+    }
+
     pub fn view_matrix(&self) -> Mat4 {
         Mat4::look_at_rh(self.eye(), self.center, Vec3::Z)
     }

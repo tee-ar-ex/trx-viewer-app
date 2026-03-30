@@ -105,109 +105,25 @@ pub(super) fn intersect_edge_with_slice(
 }
 
 impl super::TrxViewerApp {
-    /// Draw the sphere query as a circle on a slice view.
-    pub(super) fn draw_sphere_circle(
-        &self,
-        ui: &egui::Ui,
-        rect: egui::Rect,
-        axis_index: usize,
-        view_proj: glam::Mat4,
-        slice_pos: f32,
-    ) {
-        // Get the sphere center coordinate along this slice's normal axis
-        let center_on_axis = match axis_index {
-            0 => self.sphere_center.z, // axial
-            1 => self.sphere_center.y, // coronal
-            _ => self.sphere_center.x, // sagittal
-        };
+    fn gifti_axis_bounds(&self, axis_index: usize) -> Option<(f32, f32)> {
+        let mut min_pos = f32::INFINITY;
+        let mut max_pos = f32::NEG_INFINITY;
 
-        let d = (slice_pos - center_on_axis).abs();
-        if d >= self.sphere_radius {
-            return;
+        for surface in &self.gifti_surfaces {
+            let (surface_min, surface_max) = match axis_index {
+                0 => (surface.data.bbox_min.z, surface.data.bbox_max.z),
+                1 => (surface.data.bbox_min.y, surface.data.bbox_max.y),
+                _ => (surface.data.bbox_min.x, surface.data.bbox_max.x),
+            };
+            min_pos = min_pos.min(surface_min);
+            max_pos = max_pos.max(surface_max);
         }
 
-        // Circle radius on this slice plane
-        let circle_r = (self.sphere_radius * self.sphere_radius - d * d).sqrt();
-
-        // Project sphere center to screen
-        let clip = view_proj * self.sphere_center.extend(1.0);
-        let ndc_x = clip.x / clip.w;
-        let ndc_y = clip.y / clip.w;
-        let sx = rect.left() + (ndc_x + 1.0) * 0.5 * rect.width();
-        let sy = rect.top() + (1.0 - ndc_y) * 0.5 * rect.height();
-
-        // Convert world-space radius to screen pixels
-        // Use a point offset by circle_r in the first in-plane axis
-        let offset_world = match axis_index {
-            0 => self.sphere_center + Vec3::new(circle_r, 0.0, 0.0),
-            1 => self.sphere_center + Vec3::new(circle_r, 0.0, 0.0),
-            _ => self.sphere_center + Vec3::new(0.0, circle_r, 0.0),
-        };
-        let clip2 = view_proj * offset_world.extend(1.0);
-        let ndc_x2 = clip2.x / clip2.w;
-        let ndc_y2 = clip2.y / clip2.w;
-        let sx2 = rect.left() + (ndc_x2 + 1.0) * 0.5 * rect.width();
-        let sy2 = rect.top() + (1.0 - ndc_y2) * 0.5 * rect.height();
-        let screen_r = ((sx2 - sx).powi(2) + (sy2 - sy).powi(2)).sqrt();
-
-        let painter = ui.painter_at(rect);
-        let circle_color = egui::Color32::from_rgba_unmultiplied(255, 255, 0, 200);
-        painter.circle_stroke(
-            egui::pos2(sx, sy),
-            screen_r,
-            egui::Stroke::new(2.0, circle_color),
-        );
-    }
-
-    /// Draw three axis-aligned circles in the 3D view to indicate the sphere query position.
-    pub(super) fn draw_sphere_3d(&self, ui: &egui::Ui, rect: egui::Rect, view_proj: glam::Mat4) {
-        let painter = ui.painter_at(rect);
-        let color = egui::Color32::from_rgba_unmultiplied(255, 255, 0, 200);
-        let stroke = egui::Stroke::new(1.5, color);
-        let n = 48usize;
-        let c = self.sphere_center;
-        let r = self.sphere_radius;
-
-        let project = |p: glam::Vec3| -> egui::Pos2 {
-            let clip = view_proj * p.extend(1.0);
-            let nx = clip.x / clip.w;
-            let ny = clip.y / clip.w;
-            egui::pos2(
-                rect.left() + (nx + 1.0) * 0.5 * rect.width(),
-                rect.top() + (1.0 - ny) * 0.5 * rect.height(),
-            )
-        };
-
-        // Three rings: XY (axial plane), XZ (coronal), YZ (sagittal)
-        let ring_points = |axis_a: glam::Vec3, axis_b: glam::Vec3| -> Vec<egui::Pos2> {
-            (0..=n)
-                .map(|k| {
-                    let t = k as f32 / n as f32 * std::f32::consts::TAU;
-                    project(c + axis_a * (r * t.cos()) + axis_b * (r * t.sin()))
-                })
-                .collect()
-        };
-
-        for pts in [
-            ring_points(glam::Vec3::X, glam::Vec3::Y), // XY plane
-            ring_points(glam::Vec3::X, glam::Vec3::Z), // XZ plane
-            ring_points(glam::Vec3::Y, glam::Vec3::Z), // YZ plane
-        ] {
-            for w in pts.windows(2) {
-                painter.line_segment([w[0], w[1]], stroke);
-            }
+        if min_pos.is_finite() && max_pos.is_finite() {
+            Some((min_pos, max_pos))
+        } else {
+            None
         }
-        // Small crosshair at center
-        let cp = project(c);
-        let arm = 6.0;
-        painter.line_segment(
-            [egui::pos2(cp.x - arm, cp.y), egui::pos2(cp.x + arm, cp.y)],
-            stroke,
-        );
-        painter.line_segment(
-            [egui::pos2(cp.x, cp.y - arm), egui::pos2(cp.x, cp.y + arm)],
-            stroke,
-        );
     }
 
     /// Draw anatomical orientation labels (R/L/A/P/S/I) on a slice view.
@@ -424,6 +340,60 @@ impl super::TrxViewerApp {
         }
     }
 
+    pub(super) fn step_slice(&mut self, axis_index: usize, delta: isize) -> bool {
+        if let Some(nf) = self.nifti_files.first() {
+            let vol = &nf.volume;
+            let max_idx = match axis_index {
+                0 => vol.dims[2].saturating_sub(1),
+                1 => vol.dims[1].saturating_sub(1),
+                _ => vol.dims[0].saturating_sub(1),
+            };
+            let new_idx = (self.slice_indices[axis_index] as isize + delta)
+                .clamp(0, max_idx as isize) as usize;
+            if new_idx != self.slice_indices[axis_index] {
+                self.slice_indices[axis_index] = new_idx;
+                self.slices_dirty = true;
+                return true;
+            }
+            return false;
+        }
+
+        let Some(field) = self.boundary_field.as_ref() else {
+            let Some((min_pos, max_pos)) = self.gifti_axis_bounds(axis_index) else {
+                return false;
+            };
+            let span = (max_pos - min_pos).abs();
+            let step = (span / 256.0).max(0.5);
+            let new_pos = (self.slice_world_offsets[axis_index] + delta as f32 * step)
+                .clamp(min_pos, max_pos);
+            if (new_pos - self.slice_world_offsets[axis_index]).abs() > f32::EPSILON {
+                self.slice_world_offsets[axis_index] = new_pos;
+                return true;
+            }
+            return false;
+        };
+
+        let voxel = field.grid.voxel_size_mm.max(0.5);
+        let dims = field.grid.dims;
+        let min_pos = match axis_index {
+            0 => field.grid.origin_ras.z + 0.5 * voxel,
+            1 => field.grid.origin_ras.y + 0.5 * voxel,
+            _ => field.grid.origin_ras.x + 0.5 * voxel,
+        };
+        let max_pos = match axis_index {
+            0 => field.grid.origin_ras.z + (dims[2] as f32 - 0.5) * voxel,
+            1 => field.grid.origin_ras.y + (dims[1] as f32 - 0.5) * voxel,
+            _ => field.grid.origin_ras.x + (dims[0] as f32 - 0.5) * voxel,
+        };
+        let new_pos =
+            (self.slice_world_offsets[axis_index] + delta as f32 * voxel).clamp(min_pos, max_pos);
+        if (new_pos - self.slice_world_offsets[axis_index]).abs() > f32::EPSILON {
+            self.slice_world_offsets[axis_index] = new_pos;
+            return true;
+        }
+        false
+    }
+
     pub(super) fn draw_mesh_intersections(
         &self,
         ui: &egui::Ui,
@@ -432,11 +402,7 @@ impl super::TrxViewerApp {
         view_proj: glam::Mat4,
         slice_pos: f32,
     ) {
-        let any_bundle_mesh = self
-            .trx_files
-            .iter()
-            .any(|t| t.show_bundle_mesh && !t.bundle_meshes_cpu.is_empty());
-        if self.gifti_surfaces.is_empty() && !any_bundle_mesh {
+        if self.gifti_surfaces.is_empty() {
             return;
         }
         let painter = ui.painter_at(rect);
@@ -528,21 +494,87 @@ impl super::TrxViewerApp {
                 painter.line_segment([project(p0), project(p1)], stroke);
             }
         }
+    }
 
-        // ── Bundle mesh contours ─────────────────────────────────────────────
-        for trx in &self.trx_files {
-            if !trx.show_bundle_mesh {
+    pub(super) fn draw_bundle_mesh_intersections(
+        &self,
+        ui: &egui::Ui,
+        rect: egui::Rect,
+        axis_index: usize,
+        view_proj: glam::Mat4,
+        slice_pos: f32,
+    ) {
+        if self.workflow_runtime.scene_plan.bundle_draws.is_empty() {
+            return;
+        }
+
+        let painter = ui.painter_at(rect);
+        let eps = 1e-4f32;
+
+        let project = |world: glam::Vec3| -> egui::Pos2 {
+            let clip = view_proj * world.extend(1.0);
+            let ndc_x = clip.x / clip.w;
+            let ndc_y = clip.y / clip.w;
+            egui::pos2(
+                rect.left() + (ndc_x + 1.0) * 0.5 * rect.width(),
+                rect.top() + (1.0 - ndc_y) * 0.5 * rect.height(),
+            )
+        };
+
+        for draw in &self.workflow_runtime.scene_plan.bundle_draws {
+            if draw.opacity <= 0.01 {
                 continue;
             }
-            let bundle_mesh_opacity = trx.bundle_mesh_opacity;
-            for mesh in &trx.bundle_meshes_cpu {
+            let Some(runtime) = self.workflow_display_runtimes.get(&draw.node_uuid) else {
+                continue;
+            };
+            if runtime.bundle_meshes_cpu.is_empty() {
+                continue;
+            }
+
+            for mesh in &runtime.bundle_meshes_cpu {
+                if mesh.vertices.is_empty() || mesh.indices.is_empty() {
+                    continue;
+                }
+
+                let mut bbox_min = glam::Vec3::splat(f32::INFINITY);
+                let mut bbox_max = glam::Vec3::splat(f32::NEG_INFINITY);
+                for vertex in &mesh.vertices {
+                    let pos = glam::Vec3::from(vertex.position);
+                    bbox_min = bbox_min.min(pos);
+                    bbox_max = bbox_max.max(pos);
+                }
+
+                let (smin, smax) = match axis_index {
+                    0 => (bbox_min.z, bbox_max.z),
+                    1 => (bbox_min.y, bbox_max.y),
+                    _ => (bbox_min.x, bbox_max.x),
+                };
+                if slice_pos < smin - eps || slice_pos > smax + eps {
+                    continue;
+                }
+
+                let rgb = mesh.vertices.first().map(|vertex| vertex.color).unwrap_or([
+                    0.7,
+                    0.85,
+                    1.0,
+                    draw.opacity,
+                ]);
+                let color = egui::Color32::from_rgba_unmultiplied(
+                    (rgb[0].clamp(0.0, 1.0) * 255.0) as u8,
+                    (rgb[1].clamp(0.0, 1.0) * 255.0) as u8,
+                    (rgb[2].clamp(0.0, 1.0) * 255.0) as u8,
+                    (draw.opacity.clamp(0.0, 1.0) * 255.0) as u8,
+                );
+                let stroke = egui::Stroke::new(1.15, color);
+
                 for tri in mesh.indices.chunks_exact(3) {
-                    let va = &mesh.vertices[tri[0] as usize];
-                    let vb = &mesh.vertices[tri[1] as usize];
-                    let vc = &mesh.vertices[tri[2] as usize];
-                    let a = glam::Vec3::from(va.position);
-                    let b = glam::Vec3::from(vb.position);
-                    let c = glam::Vec3::from(vc.position);
+                    let ia = tri[0] as usize;
+                    let ib = tri[1] as usize;
+                    let ic = tri[2] as usize;
+                    let a = glam::Vec3::from(mesh.vertices[ia].position);
+                    let b = glam::Vec3::from(mesh.vertices[ib].position);
+                    let c = glam::Vec3::from(mesh.vertices[ic].position);
 
                     let tmin = tri_axis_value(a, axis_index)
                         .min(tri_axis_value(b, axis_index))
@@ -554,54 +586,33 @@ impl super::TrxViewerApp {
                         continue;
                     }
 
-                    // Find intersections, interpolating color along each edge.
-                    let mut pts: Vec<(glam::Vec3, [f32; 4])> = Vec::with_capacity(2);
-                    for (p0, c0, p1, c1) in [
-                        (a, va.color, b, vb.color),
-                        (b, vb.color, c, vc.color),
-                        (c, vc.color, a, va.color),
-                    ] {
-                        let d0 = tri_axis_value(p0, axis_index) - slice_pos;
-                        let d1 = tri_axis_value(p1, axis_index) - slice_pos;
-                        if d0.abs() <= eps && d1.abs() <= eps {
-                            continue;
-                        }
-                        let t = if d0.abs() <= eps {
-                            0.0
-                        } else if d1.abs() <= eps {
-                            1.0
-                        } else if d0 * d1 < 0.0 {
-                            d0 / (d0 - d1)
-                        } else {
-                            continue;
-                        };
-                        let pos = p0 + (p1 - p0) * t;
-                        let col = [
-                            c0[0] + (c1[0] - c0[0]) * t,
-                            c0[1] + (c1[1] - c0[1]) * t,
-                            c0[2] + (c1[2] - c0[2]) * t,
-                            c0[3] + (c1[3] - c0[3]) * t,
-                        ];
-                        if !pts
-                            .iter()
-                            .any(|(q, _)| (*q - pos).length_squared() <= eps * eps)
+                    let mut pts = Vec::with_capacity(3);
+                    for (p0, p1) in [(a, b), (b, c), (c, a)] {
+                        if let Some(p) =
+                            intersect_edge_with_slice(p0, p1, axis_index, slice_pos, eps)
                         {
-                            pts.push((pos, col));
+                            if !pts
+                                .iter()
+                                .any(|q: &glam::Vec3| (*q - p).length_squared() <= eps * eps)
+                            {
+                                pts.push(p);
+                            }
                         }
                     }
                     if pts.len() < 2 {
                         continue;
                     }
-                    let (p0, col0, p1, col1) = if pts.len() == 2 {
-                        (pts[0].0, pts[0].1, pts[1].0, pts[1].1)
+
+                    let (p0, p1) = if pts.len() == 2 {
+                        (pts[0], pts[1])
                     } else {
-                        let mut best = (pts[0].0, pts[0].1, pts[1].0, pts[1].1);
-                        let mut best_d2 = (pts[1].0 - pts[0].0).length_squared();
+                        let mut best = (pts[0], pts[1]);
+                        let mut best_d2 = (pts[1] - pts[0]).length_squared();
                         for i in 0..pts.len() {
                             for j in (i + 1)..pts.len() {
-                                let d2 = (pts[j].0 - pts[i].0).length_squared();
+                                let d2 = (pts[j] - pts[i]).length_squared();
                                 if d2 > best_d2 {
-                                    best = (pts[i].0, pts[i].1, pts[j].0, pts[j].1);
+                                    best = (pts[i], pts[j]);
                                     best_d2 = d2;
                                 }
                             }
@@ -609,34 +620,83 @@ impl super::TrxViewerApp {
                         best
                     };
 
-                    let opacity_u8 = (bundle_mesh_opacity.clamp(0.0, 1.0) * 255.0) as u8;
-                    let to_color = |c: [f32; 4]| {
-                        egui::Color32::from_rgba_unmultiplied(
-                            (c[0].clamp(0.0, 1.0) * 255.0) as u8,
-                            (c[1].clamp(0.0, 1.0) * 255.0) as u8,
-                            (c[2].clamp(0.0, 1.0) * 255.0) as u8,
-                            opacity_u8,
-                        )
-                    };
-
-                    // Draw with gradient by blending colors at the two endpoints.
-                    let mid = (p0 + p1) * 0.5;
-                    let mid_col = [
-                        (col0[0] + col1[0]) * 0.5,
-                        (col0[1] + col1[1]) * 0.5,
-                        (col0[2] + col1[2]) * 0.5,
-                        (col0[3] + col1[3]) * 0.5,
-                    ];
-                    painter.line_segment(
-                        [project(p0), project(mid)],
-                        egui::Stroke::new(1.5, to_color(col0)),
-                    );
-                    painter.line_segment(
-                        [project(mid), project(p1)],
-                        egui::Stroke::new(1.5, to_color(mid_col)),
-                    );
-                    let _ = (col1, mid_col);
+                    painter.line_segment([project(p0), project(p1)], stroke);
                 }
+            }
+        }
+    }
+
+    pub(super) fn draw_parcellation_intersections(
+        &self,
+        ui: &egui::Ui,
+        rect: egui::Rect,
+        axis_index: usize,
+        view_proj: glam::Mat4,
+        slice_pos: f32,
+    ) {
+        if self
+            .workflow_runtime
+            .scene_plan
+            .parcellation_draws
+            .is_empty()
+        {
+            return;
+        }
+
+        let painter = ui.painter_at(rect);
+        let project = |world: glam::Vec3| -> egui::Pos2 {
+            let clip = view_proj * world.extend(1.0);
+            let ndc_x = clip.x / clip.w;
+            let ndc_y = clip.y / clip.w;
+            egui::pos2(
+                rect.left() + (ndc_x + 1.0) * 0.5 * rect.width(),
+                rect.top() + (1.0 - ndc_y) * 0.5 * rect.height(),
+            )
+        };
+
+        for draw in &self.workflow_runtime.scene_plan.parcellation_draws {
+            let Some(parcellation) = self
+                .parcellations
+                .iter()
+                .find(|asset| asset.asset.id == draw.source_id)
+            else {
+                continue;
+            };
+            let Some(slice_index) = parcellation.asset.data.nearest_slice_index(
+                axis_index,
+                slice_pos,
+                self.volume_center,
+            ) else {
+                continue;
+            };
+            let labels = if draw.labels.is_empty() {
+                parcellation
+                    .asset
+                    .data
+                    .label_table
+                    .keys()
+                    .copied()
+                    .filter(|label| *label != 0)
+                    .collect()
+            } else {
+                draw.labels.clone()
+            };
+            for (segment, color) in
+                parcellation
+                    .asset
+                    .data
+                    .slice_contour_segments(axis_index, slice_index, &labels)
+            {
+                let stroke = egui::Stroke::new(
+                    1.2,
+                    egui::Color32::from_rgba_unmultiplied(
+                        (color[0].clamp(0.0, 1.0) * 255.0) as u8,
+                        (color[1].clamp(0.0, 1.0) * 255.0) as u8,
+                        (color[2].clamp(0.0, 1.0) * 255.0) as u8,
+                        (draw.opacity.clamp(0.0, 1.0) * 255.0) as u8,
+                    ),
+                );
+                painter.line_segment([project(segment[0]), project(segment[1])], stroke);
             }
         }
     }

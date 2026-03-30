@@ -1,3 +1,4 @@
+use std::collections::{HashMap, VecDeque};
 use std::io::Read;
 use std::path::Path;
 
@@ -116,6 +117,10 @@ impl GiftiSurfaceData {
         if vertices.is_empty() {
             bail!("POINTSET DataArray has zero vertices");
         }
+
+        let mut tris = tris;
+        orient_triangles_consistently(&mut tris);
+        orient_surface_outward(&vertices, &mut tris);
 
         let mut indices = Vec::with_capacity(tris.len() * 3);
         let max_idx = vertices.len() as u32;
@@ -461,4 +466,171 @@ fn compute_vertex_normals(vertices: &[[f32; 3]], indices: &[u32]) -> Vec<[f32; 3
         .into_iter()
         .map(|n| n.normalize_or_zero().into())
         .collect()
+}
+
+fn orient_triangles_consistently(triangles: &mut [[u32; 3]]) {
+    if triangles.len() < 2 {
+        return;
+    }
+
+    let mut edge_map: HashMap<(u32, u32), Vec<(usize, bool)>> = HashMap::new();
+    for (tri_index, tri) in triangles.iter().copied().enumerate() {
+        for (start, end) in triangle_edges(tri) {
+            let key = if start < end {
+                (start, end)
+            } else {
+                (end, start)
+            };
+            let same_as_canonical = start < end;
+            edge_map
+                .entry(key)
+                .or_default()
+                .push((tri_index, same_as_canonical));
+        }
+    }
+
+    let mut visited = vec![false; triangles.len()];
+    let mut should_flip = vec![false; triangles.len()];
+    let mut queue = VecDeque::new();
+
+    for seed in 0..triangles.len() {
+        if visited[seed] {
+            continue;
+        }
+        visited[seed] = true;
+        queue.push_back(seed);
+
+        while let Some(current) = queue.pop_front() {
+            for (start, end) in triangle_edges(triangles[current]) {
+                let key = if start < end {
+                    (start, end)
+                } else {
+                    (end, start)
+                };
+                let Some(neighbors) = edge_map.get(&key) else {
+                    continue;
+                };
+                if neighbors.len() != 2 {
+                    continue;
+                }
+
+                let mut current_sign = None;
+                let mut neighbor = None;
+                for (tri_index, sign) in neighbors {
+                    if *tri_index == current {
+                        current_sign = Some(*sign);
+                    } else {
+                        neighbor = Some((*tri_index, *sign));
+                    }
+                }
+                let (neighbor_index, neighbor_sign) = match neighbor {
+                    Some(value) => value,
+                    None => continue,
+                };
+                let current_sign = match current_sign {
+                    Some(value) => value,
+                    None => continue,
+                };
+
+                let neighbor_flip = if current_sign == neighbor_sign {
+                    !should_flip[current]
+                } else {
+                    should_flip[current]
+                };
+                if visited[neighbor_index] {
+                    continue;
+                }
+                visited[neighbor_index] = true;
+                should_flip[neighbor_index] = neighbor_flip;
+                queue.push_back(neighbor_index);
+            }
+        }
+    }
+
+    for (tri, flip) in triangles.iter_mut().zip(should_flip) {
+        if flip {
+            tri.swap(1, 2);
+        }
+    }
+}
+
+fn orient_surface_outward(vertices: &[[f32; 3]], triangles: &mut [[u32; 3]]) {
+    if triangles.is_empty() || vertices.is_empty() {
+        return;
+    }
+
+    let centroid = vertices
+        .iter()
+        .fold(Vec3::ZERO, |acc, vertex| acc + Vec3::from(*vertex))
+        / vertices.len() as f32;
+    let orientation_score = triangles.iter().fold(0.0f32, |acc, tri| {
+        let a = Vec3::from(vertices[tri[0] as usize]);
+        let b = Vec3::from(vertices[tri[1] as usize]);
+        let c = Vec3::from(vertices[tri[2] as usize]);
+        let normal = (b - a).cross(c - a);
+        let face_center = (a + b + c) / 3.0;
+        acc + normal.dot(face_center - centroid)
+    });
+
+    if orientation_score < 0.0 {
+        for tri in triangles {
+            tri.swap(1, 2);
+        }
+    }
+}
+
+fn triangle_edges(tri: [u32; 3]) -> [(u32, u32); 3] {
+    [(tri[0], tri[1]), (tri[1], tri[2]), (tri[2], tri[0])]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{orient_surface_outward, orient_triangles_consistently, triangle_edges};
+    use glam::Vec3;
+
+    #[test]
+    fn fixes_shared_edge_winding() {
+        let mut tris = vec![[0, 1, 2], [1, 3, 2]];
+        orient_triangles_consistently(&mut tris);
+
+        let tri0_shared = triangle_edges(tris[0])
+            .into_iter()
+            .find(|edge| (edge.0 == 1 && edge.1 == 2) || (edge.0 == 2 && edge.1 == 1))
+            .unwrap();
+        let tri1_shared = triangle_edges(tris[1])
+            .into_iter()
+            .find(|edge| (edge.0 == 1 && edge.1 == 2) || (edge.0 == 2 && edge.1 == 1))
+            .unwrap();
+
+        assert_eq!(tri0_shared, (1, 2));
+        assert_eq!(tri1_shared, (2, 1));
+    }
+
+    #[test]
+    fn flips_inward_surface_outward() {
+        let vertices = vec![
+            [1.0, 1.0, 1.0],
+            [-1.0, -1.0, 1.0],
+            [-1.0, 1.0, -1.0],
+            [1.0, -1.0, -1.0],
+        ];
+        let mut tris = vec![[0, 2, 1], [0, 1, 3], [0, 3, 2], [1, 2, 3]];
+
+        orient_surface_outward(&vertices, &mut tris);
+
+        let centroid = vertices
+            .iter()
+            .fold(Vec3::ZERO, |acc, vertex| acc + Vec3::from(*vertex))
+            / vertices.len() as f32;
+        let score = tris.iter().fold(0.0f32, |acc, tri| {
+            let a = Vec3::from(vertices[tri[0] as usize]);
+            let b = Vec3::from(vertices[tri[1] as usize]);
+            let c = Vec3::from(vertices[tri[2] as usize]);
+            let normal = (b - a).cross(c - a);
+            let face_center = (a + b + c) / 3.0;
+            acc + normal.dot(face_center - centroid)
+        });
+
+        assert!(score > 0.0);
+    }
 }

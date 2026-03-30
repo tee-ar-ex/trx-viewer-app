@@ -218,16 +218,20 @@ impl GlyphResources {
         let indices = &field.sphere.indices;
         let nbins = field.sphere.vertices.len() as u32;
 
-        self.vertex_buffer = Some(device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("glyph_vertices"),
-            contents: bytemuck::cast_slice(vertices),
-            usage: wgpu::BufferUsages::VERTEX,
-        }));
-        self.index_buffer = Some(device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("glyph_indices"),
-            contents: bytemuck::cast_slice(indices),
-            usage: wgpu::BufferUsages::INDEX,
-        }));
+        self.vertex_buffer = Some(
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("glyph_vertices"),
+                contents: bytemuck::cast_slice(vertices),
+                usage: wgpu::BufferUsages::VERTEX,
+            }),
+        );
+        self.index_buffer = Some(
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("glyph_indices"),
+                contents: bytemuck::cast_slice(indices),
+                usage: wgpu::BufferUsages::INDEX,
+            }),
+        );
 
         let mut instances = Vec::new();
         let mut amplitudes = Vec::new();
@@ -247,11 +251,13 @@ impl GlyphResources {
             });
         }
 
-        self.instance_buffer = Some(device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("glyph_instances"),
-            contents: bytemuck::cast_slice(&instances),
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-        }));
+        self.instance_buffer = Some(
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("glyph_instances"),
+                contents: bytemuck::cast_slice(&instances),
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            }),
+        );
 
         let amplitude_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("glyph_amplitudes"),
@@ -334,9 +340,11 @@ impl GlyphResources {
         if self.num_indices == 0 || self.num_instances == 0 {
             return;
         }
-        let (Some(vb), Some(ib), Some(inst)) =
-            (&self.vertex_buffer, &self.index_buffer, &self.instance_buffer)
-        else {
+        let (Some(vb), Some(ib), Some(inst)) = (
+            &self.vertex_buffer,
+            &self.index_buffer,
+            &self.instance_buffer,
+        ) else {
             return;
         };
         render_pass.set_pipeline(if slice {
