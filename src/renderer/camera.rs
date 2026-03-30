@@ -15,6 +15,7 @@ pub struct OrbitCamera {
     pub fov_y: f32,
     pub near: f32,
     pub far: f32,
+    pub invert_pitch: bool,
 }
 
 impl OrbitCamera {
@@ -28,6 +29,7 @@ impl OrbitCamera {
             fov_y: std::f32::consts::FRAC_PI_4,
             near: 0.1,
             far: 10000.0,
+            invert_pitch: false,
         }
     }
 
@@ -55,9 +57,25 @@ impl OrbitCamera {
     pub fn handle_drag(&mut self, delta_x: f32, delta_y: f32) {
         let sensitivity = 0.005;
         self.yaw += delta_x * sensitivity;
-        self.pitch += delta_y * sensitivity;
+        let pitch_sign = if self.invert_pitch { -1.0 } else { 1.0 };
+        self.pitch += pitch_sign * delta_y * sensitivity;
         let limit = std::f32::consts::FRAC_PI_2 - 0.01;
         self.pitch = self.pitch.clamp(-limit, limit);
+    }
+
+    pub fn pan_screen(&mut self, delta_x: f32, delta_y: f32) {
+        let eye = self.eye();
+        let forward = (self.center - eye).normalize_or_zero();
+        let right = forward.cross(Vec3::Z).normalize_or_zero();
+        let up = right.cross(forward).normalize_or_zero();
+        let scale = self.distance * 0.0015;
+        self.center -= right * delta_x * scale;
+        self.center += up * delta_y * scale;
+    }
+
+    pub fn handle_zoom_drag(&mut self, delta_x: f32, delta_y: f32) {
+        let zoom_delta = (-delta_x - delta_y) * 0.01;
+        self.handle_scroll(zoom_delta);
     }
 
     pub fn handle_scroll(&mut self, delta: f32) {
@@ -112,14 +130,7 @@ impl OrthoSliceCamera {
         let flip_lr = matches!(self.axis, SliceAxis::Coronal);
         let (left, right) = if flip_lr { (hx, -hx) } else { (-hx, hx) };
 
-        let projection = Mat4::orthographic_rh(
-            left,
-            right,
-            -hy,
-            hy,
-            -10000.0,
-            10000.0,
-        );
+        let projection = Mat4::orthographic_rh(left, right, -hy, hy, -10000.0, 10000.0);
 
         // View matrix: look along the slice normal axis
         let (eye, target, up) = match self.axis {

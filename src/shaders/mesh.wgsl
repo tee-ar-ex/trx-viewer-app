@@ -3,12 +3,15 @@ struct Uniforms {
     color: vec4<f32>,
     camera_pos: vec3<f32>,
     shininess: f32,
-    specular_strength: f32,
-    ambient_strength: f32,
     map_opacity: f32,
     map_threshold: f32,
     scalar_min: f32,
     scalar_max: f32,
+    ambient_strength: f32,
+    key_strength: f32,
+    fill_strength: f32,
+    headlight_mix: f32,
+    specular_strength: f32,
     scalar_enabled: u32,
     colormap: u32,
 }
@@ -102,10 +105,6 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     if dot(N, V) < 0.0 {
         N = -N;
     }
-    // Headlight-style illumination keeps meshes readable under interaction.
-    let L = V;
-    let H = normalize(L + V);
-
     var base_rgb = uniforms.color.rgb;
     if uniforms.scalar_enabled == 1u {
         let denom = max(uniforms.scalar_max - uniforms.scalar_min, 1e-6);
@@ -115,10 +114,15 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         base_rgb = mix(uniforms.color.rgb, map_rgb, map_alpha);
     }
 
-    let diff = max(dot(N, L), 0.0);
-    let spec = pow(max(dot(N, H), 0.0), uniforms.shininess) * uniforms.specular_strength;
-    let ambient = uniforms.ambient_strength;
+    let key = max(dot(N, normalize(vec3<f32>(0.45, 0.55, 0.9))), 0.0);
+    let fill = max(dot(N, normalize(vec3<f32>(-0.7, 0.2, 0.65))), 0.0);
+    let head = max(dot(N, V), 0.0);
+    let spec = pow(head, uniforms.shininess) * uniforms.specular_strength;
+    let shade = uniforms.ambient_strength
+        + uniforms.key_strength * key
+        + uniforms.fill_strength * fill
+        + uniforms.headlight_mix * head;
 
-    let lit = base_rgb * (ambient + diff) + vec3<f32>(spec);
+    let lit = base_rgb * shade + vec3<f32>(spec);
     return vec4<f32>(clamp(lit, vec3<f32>(0.0), vec3<f32>(1.0)), uniforms.color.a);
 }

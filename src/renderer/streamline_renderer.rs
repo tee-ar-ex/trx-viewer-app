@@ -1,6 +1,7 @@
 use wgpu::util::DeviceExt;
 
-use crate::data::trx_data::{TrxGpuData, TubeVertex};
+use crate::app::AppSceneLightingParams as SceneLightingParams;
+use crate::data::trx_data::{TrxGpuData, TubeMeshVertex};
 
 /// Holds StreamlineResources for all loaded TRX files, keyed by FileId.
 pub struct AllStreamlineResources {
@@ -13,13 +14,13 @@ pub struct StreamlineResources {
     pub pipeline: wgpu::RenderPipeline,
     /// Line-based pipeline for slice views (depth Always).
     pub slice_pipeline: wgpu::RenderPipeline,
-    /// Tube impostor pipeline. 3D viewport.
+    /// Streamtube mesh pipeline. 3D viewport.
     pub tube_pipeline: wgpu::RenderPipeline,
     pub position_buffer: wgpu::Buffer,
     pub color_buffer: wgpu::Buffer,
     pub tangent_buffer: wgpu::Buffer,
     pub index_buffer: wgpu::Buffer,
-    /// Tube geometry — rebuilt whenever the selected set changes.
+    /// Tube mesh geometry — rebuilt whenever the selected set changes.
     pub tube_vertex_buffer: Option<wgpu::Buffer>,
     pub tube_index_buffer: Option<wgpu::Buffer>,
     pub num_tube_indices: u32,
@@ -44,6 +45,12 @@ struct Uniforms {
     slab_max: f32,
     /// Tube radius (mm). Reused as depth_far for depth-cue mode.
     tube_radius: f32,
+    ambient_strength: f32,
+    key_strength: f32,
+    fill_strength: f32,
+    headlight_mix: f32,
+    specular_strength: f32,
+    _pad: [f32; 3],
 }
 
 impl StreamlineResources {
@@ -54,16 +61,12 @@ impl StreamlineResources {
     ) -> Self {
         let line_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("streamline_shader"),
-            source: wgpu::ShaderSource::Wgsl(
-                include_str!("../shaders/streamline.wgsl").into(),
-            ),
+            source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/streamline.wgsl").into()),
         });
 
         let tube_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("tube_shader"),
-            source: wgpu::ShaderSource::Wgsl(
-                include_str!("../shaders/tube.wgsl").into(),
-            ),
+            source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/tube.wgsl").into()),
         });
 
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -88,6 +91,12 @@ impl StreamlineResources {
             slab_min: 0.0,
             slab_max: 0.0,
             tube_radius: 0.5,
+            ambient_strength: 0.46,
+            key_strength: 0.34,
+            fill_strength: 0.18,
+            headlight_mix: 0.18,
+            specular_strength: 0.14,
+            _pad: [0.0; 3],
         };
 
         let uniform_buffers: [wgpu::Buffer; 4] = std::array::from_fn(|i| {
@@ -144,36 +153,62 @@ impl StreamlineResources {
             }],
         };
 
-        // ── Tube vertex buffer layout (single interleaved buffer) ────────────
-        // TubeVertex layout: p0(12) + p1(12) + color(16) + uv(8) + _pad(8) = 56 bytes
-        let tube_stride = std::mem::size_of::<TubeVertex>() as wgpu::BufferAddress;
+        // ── Tube mesh vertex buffer layout (single interleaved buffer) ───────
+        let tube_stride = std::mem::size_of::<TubeMeshVertex>() as wgpu::BufferAddress;
         let tube_layout = wgpu::VertexBufferLayout {
             array_stride: tube_stride,
             step_mode: wgpu::VertexStepMode::Vertex,
             attributes: &[
-                wgpu::VertexAttribute { offset: 0,  shader_location: 0, format: wgpu::VertexFormat::Float32x3 }, // p0
-                wgpu::VertexAttribute { offset: 12, shader_location: 1, format: wgpu::VertexFormat::Float32x3 }, // p1
-                wgpu::VertexAttribute { offset: 24, shader_location: 2, format: wgpu::VertexFormat::Float32x4 }, // color
-                wgpu::VertexAttribute { offset: 40, shader_location: 3, format: wgpu::VertexFormat::Float32x2 }, // uv
+                wgpu::VertexAttribute {
+                    offset: 0,
+                    shader_location: 0,
+                    format: wgpu::VertexFormat::Float32x3,
+                }, // position
+                wgpu::VertexAttribute {
+                    offset: 12,
+                    shader_location: 1,
+                    format: wgpu::VertexFormat::Float32x3,
+                }, // normal
+                wgpu::VertexAttribute {
+                    offset: 24,
+                    shader_location: 2,
+                    format: wgpu::VertexFormat::Float32x4,
+                }, // color
             ],
         };
 
         let pipeline = Self::make_line_pipeline(
-            device, &pipeline_layout, &line_shader, target_format,
-            &[position_layout.clone(), color_layout.clone(), tangent_layout.clone()],
-            wgpu::CompareFunction::Less, true,
+            device,
+            &pipeline_layout,
+            &line_shader,
+            target_format,
+            &[
+                position_layout.clone(),
+                color_layout.clone(),
+                tangent_layout.clone(),
+            ],
+            wgpu::CompareFunction::Less,
+            true,
         );
 
         let slice_pipeline = Self::make_line_pipeline(
-            device, &pipeline_layout, &line_shader, target_format,
+            device,
+            &pipeline_layout,
+            &line_shader,
+            target_format,
             &[position_layout, color_layout, tangent_layout],
-            wgpu::CompareFunction::Always, false,
+            wgpu::CompareFunction::Always,
+            false,
         );
 
         let tube_pipeline = Self::make_tube_pipeline(
-            device, &pipeline_layout, &tube_shader, target_format,
+            device,
+            &pipeline_layout,
+            &tube_shader,
+            target_format,
             &[tube_layout],
-            wgpu::CompareFunction::Less, true,
+            wgpu::CompareFunction::Less,
+            true,
         );
 
         let position_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -322,6 +357,7 @@ impl StreamlineResources {
         slab_min: f32,
         slab_max: f32,
         tube_radius: f32,
+        scene_lighting: SceneLightingParams,
     ) {
         let uniforms = Uniforms {
             view_proj: view_proj.to_cols_array_2d(),
@@ -331,8 +367,18 @@ impl StreamlineResources {
             slab_min,
             slab_max,
             tube_radius,
+            ambient_strength: scene_lighting.ambient_strength(),
+            key_strength: scene_lighting.key_strength(),
+            fill_strength: scene_lighting.fill_strength(),
+            headlight_mix: scene_lighting.headlight_mix(),
+            specular_strength: scene_lighting.specular_strength(),
+            _pad: [0.0; 3],
         };
-        queue.write_buffer(&self.uniform_buffers[viewport], 0, bytemuck::bytes_of(&uniforms));
+        queue.write_buffer(
+            &self.uniform_buffers[viewport],
+            0,
+            bytemuck::bytes_of(&uniforms),
+        );
     }
 
     /// Re-upload only the color buffer.
@@ -341,12 +387,7 @@ impl StreamlineResources {
     }
 
     /// Replace the line index buffer contents and update the draw count.
-    pub fn update_indices(
-        &mut self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        indices: &[u32],
-    ) {
+    pub fn update_indices(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, indices: &[u32]) {
         let new_size = (indices.len() * std::mem::size_of::<u32>()) as u64;
         if new_size <= self.index_buffer.size() {
             queue.write_buffer(&self.index_buffer, 0, bytemuck::cast_slice(indices));
@@ -364,7 +405,7 @@ impl StreamlineResources {
     pub fn update_tube_geometry(
         &mut self,
         device: &wgpu::Device,
-        vertices: &[TubeVertex],
+        vertices: &[TubeMeshVertex],
         indices: &[u32],
     ) {
         if vertices.is_empty() {
@@ -374,35 +415,42 @@ impl StreamlineResources {
             return;
         }
 
-        // Each segment = 4 vertices (56 bytes each) + 6 indices (4 bytes each).
         // Clamp to the device's 1 GB buffer limit.
         const MAX_BUFFER_BYTES: usize = 1 << 30; // 1 GB
-        let max_verts = MAX_BUFFER_BYTES / std::mem::size_of::<TubeVertex>();
-        // Round down to a multiple of 4 so we never split a segment.
-        let max_verts = (max_verts / 4) * 4;
-        let max_indices = (max_verts / 4) * 6;
-
+        let max_verts = MAX_BUFFER_BYTES / std::mem::size_of::<TubeMeshVertex>();
         let truncated = vertices.len() > max_verts;
         let vertices = &vertices[..vertices.len().min(max_verts)];
-        let indices  = &indices[..indices.len().min(max_indices)];
+
+        let mut filtered_indices = Vec::with_capacity(indices.len());
+        for tri in indices.chunks_exact(3) {
+            if tri.iter().all(|&idx| idx < vertices.len() as u32) {
+                filtered_indices.extend_from_slice(tri);
+            } else {
+                break;
+            }
+        }
 
         if truncated {
             log::warn!(
-                "Tube geometry truncated to {} segments due to GPU buffer size limit.",
-                vertices.len() / 4,
+                "Tube geometry truncated to {} vertices due to GPU buffer size limit.",
+                vertices.len(),
             );
         }
 
-        self.tube_vertex_buffer = Some(device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("tube_vertices"),
-            contents: bytemuck::cast_slice(vertices),
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-        }));
-        self.tube_index_buffer = Some(device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("tube_indices"),
-            contents: bytemuck::cast_slice(indices),
-            usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
-        }));
-        self.num_tube_indices = indices.len() as u32;
+        self.tube_vertex_buffer = Some(device.create_buffer_init(
+            &wgpu::util::BufferInitDescriptor {
+                label: Some("tube_vertices"),
+                contents: bytemuck::cast_slice(vertices),
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            },
+        ));
+        self.tube_index_buffer = Some(device.create_buffer_init(
+            &wgpu::util::BufferInitDescriptor {
+                label: Some("tube_indices"),
+                contents: bytemuck::cast_slice(&filtered_indices),
+                usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+            },
+        ));
+        self.num_tube_indices = filtered_indices.len() as u32;
     }
 }

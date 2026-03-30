@@ -1,6 +1,40 @@
 use glam::Vec3;
+use std::path::Path;
 
 use crate::data::trx_data::ColorMode;
+use trx_rs::Format;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum DroppedPathKind {
+    OpenTrx,
+    ImportTractogram(Format),
+    OpenNifti,
+    OpenGifti,
+    Unsupported,
+}
+
+pub(super) fn classify_dropped_path(path: &Path) -> DroppedPathKind {
+    match trx_rs::detect_format(path) {
+        Ok(Format::Trx) => DroppedPathKind::OpenTrx,
+        Ok(format @ (Format::Tck | Format::Vtk | Format::TinyTrack)) => {
+            DroppedPathKind::ImportTractogram(format)
+        }
+        Err(_) => {
+            let ext = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("")
+                .to_lowercase();
+            let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+            match ext.as_str() {
+                "gz" if stem.ends_with(".nii") => DroppedPathKind::OpenNifti,
+                "nii" => DroppedPathKind::OpenNifti,
+                "gii" | "gifti" => DroppedPathKind::OpenGifti,
+                _ => DroppedPathKind::Unsupported,
+            }
+        }
+    }
+}
 
 pub(super) fn tri_axis_value(p: glam::Vec3, axis_index: usize) -> f32 {
     match axis_index {
@@ -18,7 +52,9 @@ pub(super) fn scalar_range_opt(
     min: f32,
     max: f32,
 ) -> Option<(f32, f32)> {
-    if auto { return None; }
+    if auto {
+        return None;
+    }
     match mode {
         ColorMode::Dpv(_) | ColorMode::Dps(_) => Some((min, max)),
         _ => None,
@@ -124,12 +160,7 @@ impl super::TrxViewerApp {
     }
 
     /// Draw three axis-aligned circles in the 3D view to indicate the sphere query position.
-    pub(super) fn draw_sphere_3d(
-        &self,
-        ui: &egui::Ui,
-        rect: egui::Rect,
-        view_proj: glam::Mat4,
-    ) {
+    pub(super) fn draw_sphere_3d(&self, ui: &egui::Ui, rect: egui::Rect, view_proj: glam::Mat4) {
         let painter = ui.painter_at(rect);
         let color = egui::Color32::from_rgba_unmultiplied(255, 255, 0, 200);
         let stroke = egui::Stroke::new(1.5, color);
@@ -169,8 +200,14 @@ impl super::TrxViewerApp {
         // Small crosshair at center
         let cp = project(c);
         let arm = 6.0;
-        painter.line_segment([egui::pos2(cp.x - arm, cp.y), egui::pos2(cp.x + arm, cp.y)], stroke);
-        painter.line_segment([egui::pos2(cp.x, cp.y - arm), egui::pos2(cp.x, cp.y + arm)], stroke);
+        painter.line_segment(
+            [egui::pos2(cp.x - arm, cp.y), egui::pos2(cp.x + arm, cp.y)],
+            stroke,
+        );
+        painter.line_segment(
+            [egui::pos2(cp.x, cp.y - arm), egui::pos2(cp.x, cp.y + arm)],
+            stroke,
+        );
     }
 
     /// Draw anatomical orientation labels (R/L/A/P/S/I) on a slice view.
@@ -234,10 +271,7 @@ impl super::TrxViewerApp {
                 f32::INFINITY
             };
             let t = tx.min(ty);
-            let label_pos = egui::pos2(
-                center_screen.x + dir.x * t,
-                center_screen.y + dir.y * t,
-            );
+            let label_pos = egui::pos2(center_screen.x + dir.x * t, center_screen.y + dir.y * t);
 
             painter.text(
                 label_pos,
@@ -279,10 +313,7 @@ impl super::TrxViewerApp {
             };
 
             let end = origin_screen + dir_norm * axis_length;
-            painter.line_segment(
-                [origin_screen, end],
-                egui::Stroke::new(2.0, color),
-            );
+            painter.line_segment([origin_screen, end], egui::Stroke::new(2.0, color));
             painter.text(
                 end + dir_norm * 10.0,
                 egui::Align2::CENTER_CENTER,
@@ -401,7 +432,10 @@ impl super::TrxViewerApp {
         view_proj: glam::Mat4,
         slice_pos: f32,
     ) {
-        let any_bundle_mesh = self.trx_files.iter().any(|t| t.show_bundle_mesh && !t.bundle_meshes_cpu.is_empty());
+        let any_bundle_mesh = self
+            .trx_files
+            .iter()
+            .any(|t| t.show_bundle_mesh && !t.bundle_meshes_cpu.is_empty());
         if self.gifti_surfaces.is_empty() && !any_bundle_mesh {
             return;
         }
@@ -462,7 +496,10 @@ impl super::TrxViewerApp {
                 let mut pts = Vec::with_capacity(3);
                 for (p0, p1) in [(a, b), (b, c), (c, a)] {
                     if let Some(p) = intersect_edge_with_slice(p0, p1, axis_index, slice_pos, eps) {
-                        if !pts.iter().any(|q: &glam::Vec3| (*q - p).length_squared() <= eps * eps) {
+                        if !pts
+                            .iter()
+                            .any(|q: &glam::Vec3| (*q - p).length_squared() <= eps * eps)
+                        {
                             pts.push(p);
                         }
                     }
@@ -494,16 +531,18 @@ impl super::TrxViewerApp {
 
         // ── Bundle mesh contours ─────────────────────────────────────────────
         for trx in &self.trx_files {
-            if !trx.show_bundle_mesh { continue; }
+            if !trx.show_bundle_mesh {
+                continue;
+            }
             let bundle_mesh_opacity = trx.bundle_mesh_opacity;
             for mesh in &trx.bundle_meshes_cpu {
                 for tri in mesh.indices.chunks_exact(3) {
                     let va = &mesh.vertices[tri[0] as usize];
                     let vb = &mesh.vertices[tri[1] as usize];
                     let vc = &mesh.vertices[tri[2] as usize];
-                    let a  = glam::Vec3::from(va.position);
-                    let b  = glam::Vec3::from(vb.position);
-                    let c  = glam::Vec3::from(vc.position);
+                    let a = glam::Vec3::from(va.position);
+                    let b = glam::Vec3::from(vb.position);
+                    let c = glam::Vec3::from(vc.position);
 
                     let tmin = tri_axis_value(a, axis_index)
                         .min(tri_axis_value(b, axis_index))
@@ -524,11 +563,18 @@ impl super::TrxViewerApp {
                     ] {
                         let d0 = tri_axis_value(p0, axis_index) - slice_pos;
                         let d1 = tri_axis_value(p1, axis_index) - slice_pos;
-                        if d0.abs() <= eps && d1.abs() <= eps { continue; }
-                        let t = if d0.abs() <= eps { 0.0 }
-                                else if d1.abs() <= eps { 1.0 }
-                                else if d0 * d1 < 0.0 { d0 / (d0 - d1) }
-                                else { continue };
+                        if d0.abs() <= eps && d1.abs() <= eps {
+                            continue;
+                        }
+                        let t = if d0.abs() <= eps {
+                            0.0
+                        } else if d1.abs() <= eps {
+                            1.0
+                        } else if d0 * d1 < 0.0 {
+                            d0 / (d0 - d1)
+                        } else {
+                            continue;
+                        };
                         let pos = p0 + (p1 - p0) * t;
                         let col = [
                             c0[0] + (c1[0] - c0[0]) * t,
@@ -536,11 +582,16 @@ impl super::TrxViewerApp {
                             c0[2] + (c1[2] - c0[2]) * t,
                             c0[3] + (c1[3] - c0[3]) * t,
                         ];
-                        if !pts.iter().any(|(q, _)| (*q - pos).length_squared() <= eps * eps) {
+                        if !pts
+                            .iter()
+                            .any(|(q, _)| (*q - pos).length_squared() <= eps * eps)
+                        {
                             pts.push((pos, col));
                         }
                     }
-                    if pts.len() < 2 { continue; }
+                    if pts.len() < 2 {
+                        continue;
+                    }
                     let (p0, col0, p1, col1) = if pts.len() == 2 {
                         (pts[0].0, pts[0].1, pts[1].0, pts[1].1)
                     } else {
@@ -549,19 +600,24 @@ impl super::TrxViewerApp {
                         for i in 0..pts.len() {
                             for j in (i + 1)..pts.len() {
                                 let d2 = (pts[j].0 - pts[i].0).length_squared();
-                                if d2 > best_d2 { best = (pts[i].0, pts[i].1, pts[j].0, pts[j].1); best_d2 = d2; }
+                                if d2 > best_d2 {
+                                    best = (pts[i].0, pts[i].1, pts[j].0, pts[j].1);
+                                    best_d2 = d2;
+                                }
                             }
                         }
                         best
                     };
 
                     let opacity_u8 = (bundle_mesh_opacity.clamp(0.0, 1.0) * 255.0) as u8;
-                    let to_color = |c: [f32; 4]| egui::Color32::from_rgba_unmultiplied(
-                        (c[0].clamp(0.0, 1.0) * 255.0) as u8,
-                        (c[1].clamp(0.0, 1.0) * 255.0) as u8,
-                        (c[2].clamp(0.0, 1.0) * 255.0) as u8,
-                        opacity_u8,
-                    );
+                    let to_color = |c: [f32; 4]| {
+                        egui::Color32::from_rgba_unmultiplied(
+                            (c[0].clamp(0.0, 1.0) * 255.0) as u8,
+                            (c[1].clamp(0.0, 1.0) * 255.0) as u8,
+                            (c[2].clamp(0.0, 1.0) * 255.0) as u8,
+                            opacity_u8,
+                        )
+                    };
 
                     // Draw with gradient by blending colors at the two endpoints.
                     let mid = (p0 + p1) * 0.5;
@@ -583,5 +639,26 @@ impl super::TrxViewerApp {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn classify_foreign_tractograms_for_import() {
+        assert_eq!(
+            classify_dropped_path(Path::new("bundle.tck.gz")),
+            DroppedPathKind::ImportTractogram(Format::Tck)
+        );
+        assert_eq!(
+            classify_dropped_path(Path::new("bundle.vtk")),
+            DroppedPathKind::ImportTractogram(Format::Vtk)
+        );
+        assert_eq!(
+            classify_dropped_path(Path::new("bundle.tt.gz")),
+            DroppedPathKind::ImportTractogram(Format::TinyTrack)
+        );
     }
 }

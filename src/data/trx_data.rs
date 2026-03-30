@@ -1,11 +1,10 @@
-use std::collections::HashSet;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::path::Path;
 
-use bytemuck::Pod;
-use glam::Vec3;
-use trx_rs::{AnyTrxFile, DType, TrxFile, TrxScalar};
 use crate::data::gifti_data::GiftiSurfaceData;
+use glam::Vec3;
+use trx_rs::{build_streamline_aabbs_from_slices, AnyTrxFile, DataArray, StreamlineAabb, Tractogram};
 
 /// Rendering style for streamlines.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -14,7 +13,7 @@ pub enum RenderStyle {
     Flat = 0,
     /// Zoeckler illuminated lines (tangent-based Phong).
     Illuminated = 1,
-    /// Billboard tube impostors with cylinder shading.
+    /// True triangle-mesh streamtubes.
     Tubes = 2,
     /// Depth-cued lines (brightness fades with camera distance).
     DepthCue = 3,
@@ -36,11 +35,12 @@ pub enum ColorMode {
 }
 
 /// GPU-ready streamline data extracted from a TRX file.
+#[derive(Clone)]
 pub struct TrxGpuData {
     /// Raw positions in RAS+ space.
     pub positions: Vec<[f32; 3]>,
     /// Streamline offsets (length = nb_streamlines + 1).
-    pub offsets: Vec<u64>,
+    pub offsets: Vec<u32>,
     /// Bounding box min/max in RAS+ space.
     pub bbox_min: Vec3,
     pub bbox_max: Vec3,
@@ -53,6 +53,8 @@ pub struct TrxGpuData {
     pub dps_names: Vec<String>,
     /// Available group names and their streamline indices.
     pub groups: Vec<(String, Vec<u32>)>,
+    /// Optional per-group colors from DPG metadata, aligned with `groups`.
+    pub group_colors: Vec<Option<[f32; 4]>>,
     /// Cached DPV data: each entry is a flat Vec<f32> (one value per vertex).
     pub dpv_data: Vec<(String, Vec<f32>)>,
     /// Cached DPS data: each entry is a flat Vec<f32> (one value per streamline).
@@ -63,24 +65,20 @@ pub struct TrxGpuData {
     pub colors: Vec<[f32; 4]>,
     /// Full line-segment index buffer (all streamlines).
     pub all_indices: Vec<u32>,
-    /// Per-streamline axis-aligned bounding boxes: [min_x, min_y, min_z, max_x, max_y, max_z].
-    pub aabbs: Vec<[f32; 6]>,
+    /// Per-streamline axis-aligned bounding boxes.
+    pub aabbs: Vec<StreamlineAabb>,
 }
 
-/// Per-corner vertex for tube impostor rendering.
-/// Each line segment expands to 4 of these (a billboard quad).
+/// Per-vertex data for true streamline tube meshes.
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
-pub struct TubeVertex {
-    /// Segment start position.
-    pub p0: [f32; 3],
-    /// Segment end position.
-    pub p1: [f32; 3],
-    /// Vertex color (from the endpoint this corner belongs to).
+pub struct TubeMeshVertex {
+    /// Vertex position in world space.
+    pub position: [f32; 3],
+    /// Outward-facing normal in world space.
+    pub normal: [f32; 3],
+    /// Vertex color.
     pub color: [f32; 4],
-    /// Corner offset: x = lateral side (-1 or +1), y = end (-1=p0, +1=p1).
-    pub uv: [f32; 2],
-    pub _pad: [f32; 2],
 }
 
 /// Tableau-20 palette (matplotlib `tab20`) as linear RGB floats [0, 1].
@@ -128,39 +126,39 @@ fn group_name_color(name: &str) -> Option<[f32; 4]> {
     let rgb = |r: f32, g: f32, b: f32| -> [f32; 4] { [r, g, b, 1.0] };
 
     match name {
-        "Left Anterior Thalamic"         | "C_L"              => Some(t(0)),
-        "Right Anterior Thalamic"        | "C_R"              => Some(t(1)),
-        "Left Corticospinal"                                   => Some(t(2)),
-        "Right Corticospinal"                                  => Some(t(3)),
-        "Left Cingulum Cingulate"        | "MCP"              => Some(t(4)),
-        "Right Cingulum Cingulate"       | "CCMid"            => Some(t(5)),
-        "Left Posterior Arcuate"                               => Some(t(6)),
-        "Right Posterior Arcuate"                              => Some(t(7)),
-        "Forceps Minor"                  | "CC_ForcepsMinor"  => Some(t(8)),
-        "Forceps Major"                  | "CC_ForcepsMajor"  => Some(t(9)),
-        "Left Inferior Fronto-occipital" | "IFOF_L"           => Some(t(10)),
-        "Right Inferior Fronto-occipital"| "IFOF_R"           => Some(t(11)),
-        "Left Inferior Longitudinal"     | "F_L"              => Some(t(12)),
-        "Right Inferior Longitudinal"    | "F_R"              => Some(t(13)),
-        "Left Superior Longitudinal"                           => Some(t(14)),
-        "Right Superior Longitudinal"                          => Some(t(15)),
-        "Left Uncinate"                  | "UF_L"             => Some(t(16)),
-        "Right Uncinate"                 | "UF_R"             => Some(t(17)),
-        "Left Arcuate"                   | "AF_L"             => Some(t(18)),
-        "Right Arcuate"                  | "AF_R"             => Some(t(19)),
-        "Left Vertical Occipital"                              => Some(e(0)),
-        "Right Vertical Occipital"                             => Some(e(1)),
-        "median"                                               => Some(t(6)),
+        "Left Anterior Thalamic" | "C_L" => Some(t(0)),
+        "Right Anterior Thalamic" | "C_R" => Some(t(1)),
+        "Left Corticospinal" => Some(t(2)),
+        "Right Corticospinal" => Some(t(3)),
+        "Left Cingulum Cingulate" | "MCP" => Some(t(4)),
+        "Right Cingulum Cingulate" | "CCMid" => Some(t(5)),
+        "Left Posterior Arcuate" => Some(t(6)),
+        "Right Posterior Arcuate" => Some(t(7)),
+        "Forceps Minor" | "CC_ForcepsMinor" => Some(t(8)),
+        "Forceps Major" | "CC_ForcepsMajor" => Some(t(9)),
+        "Left Inferior Fronto-occipital" | "IFOF_L" => Some(t(10)),
+        "Right Inferior Fronto-occipital" | "IFOF_R" => Some(t(11)),
+        "Left Inferior Longitudinal" | "F_L" => Some(t(12)),
+        "Right Inferior Longitudinal" | "F_R" => Some(t(13)),
+        "Left Superior Longitudinal" => Some(t(14)),
+        "Right Superior Longitudinal" => Some(t(15)),
+        "Left Uncinate" | "UF_L" => Some(t(16)),
+        "Right Uncinate" | "UF_R" => Some(t(17)),
+        "Left Arcuate" | "AF_L" => Some(t(18)),
+        "Right Arcuate" | "AF_R" => Some(t(19)),
+        "Left Vertical Occipital" => Some(e(0)),
+        "Right Vertical Occipital" => Some(e(1)),
+        "median" => Some(t(6)),
         // Paul Tol's palette for callosal bundles
-        "Callosum Orbital"                                     => Some(rgb(0.20, 0.13, 0.53)),
-        "Callosum Anterior Frontal"                            => Some(rgb(0.07, 0.47, 0.20)),
-        "Callosum Superior Frontal"                            => Some(rgb(0.27, 0.67, 0.60)),
-        "Callosum Motor"                                       => Some(rgb(0.53, 0.80, 0.93)),
-        "Callosum Superior Parietal"                           => Some(rgb(0.87, 0.80, 0.47)),
-        "Callosum Posterior Parietal"                          => Some(rgb(0.80, 0.40, 0.47)),
-        "Callosum Occipital"                                   => Some(rgb(0.67, 0.27, 0.60)),
-        "Callosum Temporal"                                    => Some(rgb(0.53, 0.13, 0.33)),
-        _                                                      => None,
+        "Callosum Orbital" => Some(rgb(0.20, 0.13, 0.53)),
+        "Callosum Anterior Frontal" => Some(rgb(0.07, 0.47, 0.20)),
+        "Callosum Superior Frontal" => Some(rgb(0.27, 0.67, 0.60)),
+        "Callosum Motor" => Some(rgb(0.53, 0.80, 0.93)),
+        "Callosum Superior Parietal" => Some(rgb(0.87, 0.80, 0.47)),
+        "Callosum Posterior Parietal" => Some(rgb(0.80, 0.40, 0.47)),
+        "Callosum Occipital" => Some(rgb(0.67, 0.27, 0.60)),
+        "Callosum Temporal" => Some(rgb(0.53, 0.13, 0.33)),
+        _ => None,
     }
 }
 
@@ -168,80 +166,85 @@ impl TrxGpuData {
     /// Load a TRX file and produce GPU-ready data with direction-RGB coloring.
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         let any = AnyTrxFile::load(path)?;
+        Self::from_any_trx(&any)
+    }
 
-        // Convert all positions to f32
-        let positions: Vec<[f32; 3]> = match any.positions_ref() {
-            trx_rs::PositionsRef::F32(p) => p.to_vec(),
-            trx_rs::PositionsRef::F64(p) => p
-                .iter()
-                .map(|v| [v[0] as f32, v[1] as f32, v[2] as f32])
-                .collect(),
-            trx_rs::PositionsRef::F16(p) => p
-                .iter()
-                .map(|v| {
-                    [
-                        half::f16::to_f32(v[0]),
-                        half::f16::to_f32(v[1]),
-                        half::f16::to_f32(v[2]),
-                    ]
-                })
-                .collect(),
-        };
+    pub fn from_tractogram(tractogram: &Tractogram) -> anyhow::Result<Self> {
+        let positions = tractogram.positions().to_vec();
+        let nb_vertices = positions.len();
+        let nb_streamlines = tractogram.nb_streamlines();
+        let offsets = tractogram.offsets().to_vec();
+        let groups: Vec<(String, Vec<u32>)> = tractogram
+            .groups()
+            .iter()
+            .map(|(name, members)| (name.clone(), members.clone()))
+            .collect();
+        let group_colors = groups
+            .iter()
+            .map(|(name, _)| tractogram.dpg().get(name).and_then(extract_group_color))
+            .collect();
 
+        Ok(Self::from_components(
+            positions,
+            offsets,
+            nb_streamlines,
+            nb_vertices,
+            ExtractedMetadata {
+                dpv_data: Vec::new(),
+                dps_data: Vec::new(),
+                groups,
+                group_colors,
+            },
+        ))
+    }
+
+    fn from_any_trx(any: &AnyTrxFile) -> anyhow::Result<Self> {
+        let positions = any.positions_f32();
         let nb_vertices = positions.len();
         let nb_streamlines = any.nb_streamlines();
+        let offsets = any.offsets_vec();
+        let metadata = extract_metadata(any, nb_vertices, nb_streamlines);
 
-        // Get offsets
-        let offsets: Vec<u64> = any.with_typed(
-            |trx| trx.offsets().to_vec(),
-            |trx| trx.offsets().to_vec(),
-            |trx| trx.offsets().to_vec(),
-        );
+        Ok(Self::from_components(
+            positions,
+            offsets,
+            nb_streamlines,
+            nb_vertices,
+            metadata,
+        ))
+    }
 
-        // Compute bounding box
-        let mut bbox_min = Vec3::splat(f32::INFINITY);
-        let mut bbox_max = Vec3::splat(f32::NEG_INFINITY);
-        for p in &positions {
-            let v = Vec3::from(*p);
-            bbox_min = bbox_min.min(v);
-            bbox_max = bbox_max.max(v);
-        }
-
-        // Extract DPV/DPS/groups using with_typed dispatch
-        let (dpv_data, dps_data, groups) = any.with_typed(
-            |trx| extract_metadata(trx, nb_vertices, nb_streamlines),
-            |trx| extract_metadata(trx, nb_vertices, nb_streamlines),
-            |trx| extract_metadata(trx, nb_vertices, nb_streamlines),
-        );
-
-        // Build full index buffer
+    fn from_components(
+        positions: Vec<[f32; 3]>,
+        offsets: Vec<u32>,
+        nb_streamlines: usize,
+        nb_vertices: usize,
+        metadata: ExtractedMetadata,
+    ) -> Self {
+        let (bbox_min, bbox_max) = compute_bounding_box(&positions);
         let all_indices = build_line_indices(&offsets);
-
-        // Compute tangents (used for illuminated rendering and direction-RGB colors)
         let tangents = compute_tangents(&positions, &offsets);
-        // Default: direction-RGB colors
         let colors = direction_colors_from_tangents(&tangents);
+        let aabbs = build_streamline_aabbs_from_slices(&positions, &offsets);
 
-        // Compute per-streamline AABBs for spatial queries
-        let aabbs = build_streamline_aabbs(&positions, &offsets);
-
-        Ok(Self {
+        Self {
             positions,
             offsets,
             bbox_min,
             bbox_max,
             nb_streamlines,
             nb_vertices,
-            dpv_names: dpv_data.iter().map(|(n, _)| n.clone()).collect(),
-            dps_names: dps_data.iter().map(|(n, _)| n.clone()).collect(),
-            groups,
-            dpv_data,
-            dps_data,
+            dpv_names: metadata.dpv_data.iter().map(|(n, _)| n.clone()).collect(),
+            dps_names: metadata.dps_data.iter().map(|(n, _)| n.clone()).collect(),
+            groups: metadata.groups,
+            group_colors: metadata.group_colors,
+            dpv_data: metadata.dpv_data,
+            dps_data: metadata.dps_data,
             tangents,
             colors,
             all_indices,
             aabbs,
-        })
+        }
     }
 
     /// Recompute vertex colors based on the given color mode.
@@ -273,18 +276,19 @@ impl TrxGpuData {
     /// Compute the natural (robust) scalar range for the given color mode, if applicable.
     pub fn scalar_range_for_mode(&self, mode: &ColorMode) -> Option<(f32, f32)> {
         match mode {
-            ColorMode::Dpv(name) => {
-                self.dpv_data.iter().find(|(n, _)| n == name)
-                    .map(|(_, data)| scalar_auto_range(data))
-            }
-            ColorMode::Dps(name) => {
-                self.dps_data.iter().find(|(n, _)| n == name)
-                    .map(|(_, data)| scalar_auto_range(data))
-            }
+            ColorMode::Dpv(name) => self
+                .dpv_data
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, data)| scalar_auto_range(data)),
+            ColorMode::Dps(name) => self
+                .dps_data
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, data)| scalar_auto_range(data)),
             _ => None,
         }
     }
-
 
     /// Build index buffer applying all active filters: group visibility, max count,
     /// ordering (for random subsetting), and optional sphere query.
@@ -309,8 +313,8 @@ impl TrxGpuData {
         for &si in &selected {
             let s = si as usize;
             if s + 1 < self.offsets.len() {
-                let start = self.offsets[s] as u32;
-                let end = self.offsets[s + 1] as u32;
+                let start = self.offsets[s];
+                let end = self.offsets[s + 1];
                 for j in start..end.saturating_sub(1) {
                     indices.push(j);
                     indices.push(j + 1);
@@ -375,10 +379,7 @@ impl TrxGpuData {
         for si in 0..self.nb_streamlines {
             let aabb = &self.aabbs[si];
             // AABB broad phase
-            if aabb[3] < sphere_min.x || aabb[0] > sphere_max.x
-                || aabb[4] < sphere_min.y || aabb[1] > sphere_max.y
-                || aabb[5] < sphere_min.z || aabb[2] > sphere_max.z
-            {
+            if !aabb.overlaps_box(sphere_min.to_array(), sphere_max.to_array()) {
                 continue;
             }
             // Vertex-level narrow phase
@@ -397,11 +398,7 @@ impl TrxGpuData {
 
     /// Query streamlines that pass within `depth_mm` of the surface.
     /// Uses streamline AABB and surface AABB broad phase, then nearest surface-vertex distance.
-    pub fn query_near_surface(
-        &self,
-        surface: &GiftiSurfaceData,
-        depth_mm: f32,
-    ) -> HashSet<u32> {
+    pub fn query_near_surface(&self, surface: &GiftiSurfaceData, depth_mm: f32) -> HashSet<u32> {
         let mut result = HashSet::new();
         if depth_mm <= 0.0 || surface.vertices.is_empty() {
             return result;
@@ -412,7 +409,7 @@ impl TrxGpuData {
         let grid = SurfaceSpatialGrid::build(&surface.vertices, depth_mm.max(0.5));
 
         for si in 0..self.nb_streamlines {
-            let aabb = self.aabbs[si];
+            let aabb = &self.aabbs[si];
             if !aabb_overlaps_expanded_surface(aabb, smin, smax) {
                 continue;
             }
@@ -420,14 +417,20 @@ impl TrxGpuData {
             let end = self.offsets[si + 1] as usize;
             for vi in start..end {
                 let p = Vec3::from(self.positions[vi]);
-                if p.x < smin.x || p.x > smax.x || p.y < smin.y || p.y > smax.y || p.z < smin.z || p.z > smax.z {
+                if p.x < smin.x
+                    || p.x > smax.x
+                    || p.y < smin.y
+                    || p.y > smax.y
+                    || p.z < smin.z
+                    || p.z > smax.z
+                {
                     continue;
                 }
-                if let Some((_, d2)) = grid.nearest_vertex(&surface.vertices, p) {
-                    if d2 <= depth2 {
-                        result.insert(si as u32);
-                        break;
-                    }
+                if let Some((_, d2)) = grid.nearest_vertex(&surface.vertices, p)
+                    && d2 <= depth2
+                {
+                    result.insert(si as u32);
+                    break;
                 }
             }
         }
@@ -466,16 +469,22 @@ impl TrxGpuData {
             let end = self.offsets[si + 1] as usize;
             for vi in start..end {
                 let p = Vec3::from(self.positions[vi]);
-                if p.x < smin.x || p.x > smax.x || p.y < smin.y || p.y > smax.y || p.z < smin.z || p.z > smax.z {
+                if p.x < smin.x
+                    || p.x > smax.x
+                    || p.y < smin.y
+                    || p.y > smax.y
+                    || p.z < smin.z
+                    || p.z > smax.z
+                {
                     continue;
                 }
-                if let Some((nearest_idx, d2)) = grid.nearest_vertex(&surface.vertices, p) {
-                    if d2 <= depth2 {
-                        density[nearest_idx] += 1.0;
-                        if dps_values.is_some() {
-                            dps_sum[nearest_idx] += dps_val;
-                            dps_count[nearest_idx] += 1;
-                        }
+                if let Some((nearest_idx, d2)) = grid.nearest_vertex(&surface.vertices, p)
+                    && d2 <= depth2
+                {
+                    density[nearest_idx] += 1.0;
+                    if dps_values.is_some() {
+                        dps_sum[nearest_idx] += dps_val;
+                        dps_count[nearest_idx] += 1;
                     }
                 }
             }
@@ -506,14 +515,24 @@ impl TrxGpuData {
         ];
 
         for (gi, (name, members)) in self.groups.iter().enumerate() {
-            let color = group_name_color(name).unwrap_or(palette[gi % palette.len()]);
+            let color = self
+                .group_colors
+                .get(gi)
+                .copied()
+                .flatten()
+                .or_else(|| group_name_color(name))
+                .unwrap_or(palette[gi % palette.len()]);
             for &streamline_idx in members {
                 let si = streamline_idx as usize;
                 if si + 1 < self.offsets.len() {
                     let start = self.offsets[si] as usize;
                     let end = self.offsets[si + 1] as usize;
-                    for v in start..end.min(self.nb_vertices) {
-                        colors[v] = color;
+                    for vertex_color in colors
+                        .iter_mut()
+                        .take(end.min(self.nb_vertices))
+                        .skip(start)
+                    {
+                        *vertex_color = color;
                     }
                 }
             }
@@ -532,47 +551,49 @@ impl TrxGpuData {
             .map(|&si| (self.offsets[si as usize + 1] - self.offsets[si as usize]) as usize)
             .sum();
         let mut positions = Vec::with_capacity(total);
-        let mut colors    = Vec::with_capacity(total);
+        let mut colors = Vec::with_capacity(total);
         for &si in selected_streamlines {
             let start = self.offsets[si as usize] as usize;
-            let end   = self.offsets[si as usize + 1] as usize;
+            let end = self.offsets[si as usize + 1] as usize;
             positions.extend_from_slice(&self.positions[start..end]);
             colors.extend_from_slice(&self.colors[start..end]);
         }
         (positions, colors)
     }
 
-    /// Build tube impostor geometry for the given selected streamlines.
-    /// Returns (vertices, indices) for TriangleList rendering.
-    pub fn build_tube_vertices(&self, selected_streamlines: &[u32]) -> (Vec<TubeVertex>, Vec<u32>) {
-        let mut vertices: Vec<TubeVertex> = Vec::new();
-        let mut indices: Vec<u32> = Vec::new();
+    /// Gather selected streamline positions/colors into contiguous arrays and offsets.
+    pub fn selected_tube_data(
+        &self,
+        selected_streamlines: &[u32],
+    ) -> (Vec<[f32; 3]>, Vec<[f32; 4]>, Vec<u32>) {
+        let total: usize = selected_streamlines
+            .iter()
+            .map(|&si| (self.offsets[si as usize + 1] - self.offsets[si as usize]) as usize)
+            .sum();
+        let mut positions = Vec::with_capacity(total);
+        let mut colors = Vec::with_capacity(total);
+        let mut offsets = Vec::with_capacity(selected_streamlines.len() + 1);
+        offsets.push(0);
 
         for &si in selected_streamlines {
-            let si = si as usize;
-            if si + 1 >= self.offsets.len() {
-                continue;
-            }
-            let start = self.offsets[si] as usize;
-            let end = self.offsets[si + 1] as usize;
-
-            for i in start..end.saturating_sub(1) {
-                let base = vertices.len() as u32;
-                let p0 = self.positions[i];
-                let p1 = self.positions[i + 1];
-                let c0 = self.colors[i];
-                let c1 = self.colors[i + 1];
-
-                // 4 corners: (lateral, end) in {-1,+1}²
-                vertices.push(TubeVertex { p0, p1, color: c0, uv: [-1.0, -1.0], _pad: [0.0; 2] });
-                vertices.push(TubeVertex { p0, p1, color: c0, uv: [ 1.0, -1.0], _pad: [0.0; 2] });
-                vertices.push(TubeVertex { p0, p1, color: c1, uv: [ 1.0,  1.0], _pad: [0.0; 2] });
-                vertices.push(TubeVertex { p0, p1, color: c1, uv: [-1.0,  1.0], _pad: [0.0; 2] });
-                indices.extend_from_slice(&[base, base+1, base+2, base, base+2, base+3]);
-            }
+            let start = self.offsets[si as usize] as usize;
+            let end = self.offsets[si as usize + 1] as usize;
+            positions.extend_from_slice(&self.positions[start..end]);
+            colors.extend_from_slice(&self.colors[start..end]);
+            offsets.push(positions.len() as u32);
         }
 
-        (vertices, indices)
+        (positions, colors, offsets)
+    }
+
+    /// Estimate tube mesh buffer size before building, using original point counts.
+    pub fn estimate_tube_mesh_bytes(&self, selected_streamlines: &[u32], sides: u32) -> usize {
+        estimate_tube_mesh_bytes_from_offsets(
+            selected_streamlines.iter().map(|&si| {
+                (self.offsets[si as usize + 1] - self.offsets[si as usize]) as usize
+            }),
+            sides,
+        )
     }
 
     pub fn center(&self) -> Vec3 {
@@ -584,89 +605,101 @@ impl TrxGpuData {
     }
 }
 
-/// Read a single-column data array as f32, handling dtype conversion.
-fn read_scalar_as_f32<P: TrxScalar + Pod>(
-    trx: &TrxFile<P>,
-    name: &str,
-    dtype: &DType,
-    is_dpv: bool,
-) -> Option<Vec<f32>> {
-    macro_rules! try_read {
-        ($t:ty, $convert:expr) => {{
-            let view = if is_dpv {
-                trx.dpv::<$t>(name).ok()?
-            } else {
-                trx.dps::<$t>(name).ok()?
-            };
-            if view.ncols() != 1 {
-                return None;
-            }
-            Some(view.rows().map(|r| $convert(r[0])).collect())
-        }};
-    }
+/// Extract DPV, DPS, and group data from a TRX file.
+struct ExtractedMetadata {
+    dpv_data: Vec<(String, Vec<f32>)>,
+    dps_data: Vec<(String, Vec<f32>)>,
+    groups: Vec<(String, Vec<u32>)>,
+    group_colors: Vec<Option<[f32; 4]>>,
+}
 
-    match dtype {
-        DType::Float32 => try_read!(f32, |v: f32| v),
-        DType::Float64 => try_read!(f64, |v: f64| v as f32),
-        DType::Float16 => try_read!(half::f16, |v: half::f16| v.to_f32()),
-        DType::UInt8 => try_read!(u8, |v: u8| v as f32),
-        DType::UInt16 => try_read!(u16, |v: u16| v as f32),
-        DType::UInt32 => try_read!(u32, |v: u32| v as f32),
-        DType::Int8 => try_read!(i8, |v: i8| v as f32),
-        DType::Int16 => try_read!(i16, |v: i16| v as f32),
-        DType::Int32 => try_read!(i32, |v: i32| v as f32),
-        _ => None,
+fn extract_metadata(
+    trx: &AnyTrxFile,
+    nb_vertices: usize,
+    nb_streamlines: usize,
+) -> ExtractedMetadata {
+    let dpv_data = trx
+        .dpv_entries()
+        .into_iter()
+        .filter(|(_, info)| info.ncols == 1)
+        .filter_map(|(name, _)| {
+            trx.scalar_dpv_f32(&name)
+                .ok()
+                .filter(|flat| flat.len() == nb_vertices)
+                .map(|flat| (name, flat))
+        })
+        .collect();
+
+    let dps_data = trx
+        .dps_entries()
+        .into_iter()
+        .filter(|(_, info)| info.ncols == 1)
+        .filter_map(|(name, _)| {
+            trx.scalar_dps_f32(&name)
+                .ok()
+                .filter(|flat| flat.len() == nb_streamlines)
+                .map(|flat| (name, flat))
+        })
+        .collect();
+
+    let groups = trx.groups_owned();
+    let group_colors = groups
+        .iter()
+        .map(|(name, _)| extract_group_color_from_any(trx, name))
+        .collect();
+
+    ExtractedMetadata {
+        dpv_data,
+        dps_data,
+        groups,
+        group_colors,
     }
 }
 
-/// Extract DPV, DPS, and group data from a typed TRX file.
-fn extract_metadata<P: TrxScalar + Pod>(
-    trx: &TrxFile<P>,
-    nb_vertices: usize,
-    nb_streamlines: usize,
-) -> (
-    Vec<(String, Vec<f32>)>,
-    Vec<(String, Vec<f32>)>,
-    Vec<(String, Vec<u32>)>,
-) {
-    let mut dpv_data = Vec::new();
-    for name in trx.dpv_names() {
-        if let Some(arr) = trx.dpv.get(name) {
-            if arr.ncols == 1 {
-                if let Some(flat) = read_scalar_as_f32(trx, name, &arr.dtype, true) {
-                    if flat.len() == nb_vertices {
-                        dpv_data.push((name.to_string(), flat));
-                    }
-                }
-            }
-        }
+fn compute_bounding_box(positions: &[[f32; 3]]) -> (Vec3, Vec3) {
+    let mut bbox_min = Vec3::splat(f32::INFINITY);
+    let mut bbox_max = Vec3::splat(f32::NEG_INFINITY);
+    for p in positions {
+        let v = Vec3::from(*p);
+        bbox_min = bbox_min.min(v);
+        bbox_max = bbox_max.max(v);
     }
+    (bbox_min, bbox_max)
+}
 
-    let mut dps_data = Vec::new();
-    for name in trx.dps_names() {
-        if let Some(arr) = trx.dps.get(name) {
-            if arr.ncols == 1 {
-                if let Some(flat) = read_scalar_as_f32(trx, name, &arr.dtype, false) {
-                    if flat.len() == nb_streamlines {
-                        dps_data.push((name.to_string(), flat));
-                    }
-                }
-            }
+fn extract_group_color_from_any(trx: &AnyTrxFile, group: &str) -> Option<[f32; 4]> {
+    trx.with_typed(
+        |inner| inner.dpg::<u8>(group, "color").ok().and_then(color_view_to_rgba),
+        |inner| inner.dpg::<u8>(group, "color").ok().and_then(color_view_to_rgba),
+        |inner| inner.dpg::<u8>(group, "color").ok().and_then(color_view_to_rgba),
+    )
+}
+
+fn extract_group_color(entries: &HashMap<String, DataArray>) -> Option<[f32; 4]> {
+    entries.get("color").and_then(|array| {
+        if array.dtype() != trx_rs::DType::UInt8 || array.ncols() != 3 || array.nrows() != 1 {
+            return None;
         }
-    }
+        let view = array.typed_view::<u8>();
+        color_view_to_rgba(view)
+    })
+}
 
-    let mut groups = Vec::new();
-    for name in trx.group_names() {
-        if let Ok(members) = trx.group(name) {
-            groups.push((name.to_string(), members.to_vec()));
-        }
+fn color_view_to_rgba(view: trx_rs::TypedView2D<'_, u8>) -> Option<[f32; 4]> {
+    if view.nrows() != 1 || view.ncols() != 3 {
+        return None;
     }
-
-    (dpv_data, dps_data, groups)
+    let row = view.row(0);
+    Some([
+        row[0] as f32 / 255.0,
+        row[1] as f32 / 255.0,
+        row[2] as f32 / 255.0,
+        1.0,
+    ])
 }
 
 /// Compute per-vertex tangent directions (unsigned, normalized).
-pub fn compute_tangents(positions: &[[f32; 3]], offsets: &[u64]) -> Vec<[f32; 3]> {
+pub fn compute_tangents(positions: &[[f32; 3]], offsets: &[u32]) -> Vec<[f32; 3]> {
     let n = positions.len();
     let mut tangents = vec![[0.5f32, 0.5, 0.5]; n];
 
@@ -704,11 +737,11 @@ fn direction_colors_from_tangents(tangents: &[[f32; 3]]) -> Vec<[f32; 4]> {
 }
 
 /// Build line-segment indices for PrimitiveTopology::LineList.
-fn build_line_indices(offsets: &[u64]) -> Vec<u32> {
+fn build_line_indices(offsets: &[u32]) -> Vec<u32> {
     let mut indices = Vec::new();
     for win in offsets.windows(2) {
-        let start = win[0] as u32;
-        let end = win[1] as u32;
+        let start = win[0];
+        let end = win[1];
         for i in start..end.saturating_sub(1) {
             indices.push(i);
             indices.push(i + 1);
@@ -753,31 +786,219 @@ pub fn colormap_bwr(t: f32) -> [f32; 4] {
     }
 }
 
-/// Compute per-streamline axis-aligned bounding boxes.
-fn build_streamline_aabbs(positions: &[[f32; 3]], offsets: &[u64]) -> Vec<[f32; 6]> {
-    let nb = offsets.len().saturating_sub(1);
-    let mut aabbs = Vec::with_capacity(nb);
+#[derive(Clone, Copy)]
+struct TubePoint {
+    position: [f32; 3],
+    color: [f32; 4],
+}
+
+fn simplify_streamline_points(positions: &[[f32; 3]], colors: &[[f32; 4]]) -> Vec<TubePoint> {
+    let mut points = Vec::with_capacity(positions.len());
+    let mut last: Option<Vec3> = None;
+
+    for (&position, &color) in positions.iter().zip(colors.iter()) {
+        let pos = Vec3::from(position);
+        if last.is_some_and(|prev| prev.distance_squared(pos) < 1e-8) {
+            continue;
+        }
+        points.push(TubePoint { position, color });
+        last = Some(pos);
+    }
+
+    points
+}
+
+pub fn build_tube_vertices_from_data(
+    positions: &[[f32; 3]],
+    colors: &[[f32; 4]],
+    offsets: &[u32],
+    radius: f32,
+    sides: u32,
+) -> (Vec<TubeMeshVertex>, Vec<u32>) {
+    let mut vertices: Vec<TubeMeshVertex> = Vec::new();
+    let mut indices: Vec<u32> = Vec::new();
+    let sides = sides.max(3) as usize;
+    let radius = radius.max(0.001);
+
     for win in offsets.windows(2) {
         let start = win[0] as usize;
         let end = win[1] as usize;
-        let mut min = [f32::INFINITY; 3];
-        let mut max = [f32::NEG_INFINITY; 3];
-        for vi in start..end {
-            let p = &positions[vi];
-            for d in 0..3 {
-                min[d] = min[d].min(p[d]);
-                max[d] = max[d].max(p[d]);
+        let points = simplify_streamline_points(&positions[start..end], &colors[start..end]);
+        if points.len() < 2 {
+            continue;
+        }
+
+        let tangents = compute_streamline_tangents(&points);
+        let frame_normals = build_parallel_transport_frames(&tangents);
+        let ring_base = vertices.len() as u32;
+
+        for ((point, tangent), frame_normal) in
+            points.iter().zip(tangents.iter()).zip(frame_normals.iter())
+        {
+            let center = Vec3::from(point.position);
+            let normal = *frame_normal;
+            let mut binormal = tangent.cross(normal).normalize_or_zero();
+            if binormal.length_squared() < 1e-8 {
+                binormal = arbitrary_perpendicular(*tangent);
+            }
+
+            for side in 0..sides {
+                let theta = std::f32::consts::TAU * (side as f32 / sides as f32);
+                let radial = normal * theta.cos() + binormal * theta.sin();
+                vertices.push(TubeMeshVertex {
+                    position: (center + radial * radius).to_array(),
+                    normal: radial.to_array(),
+                    color: point.color,
+                });
             }
         }
-        aabbs.push([min[0], min[1], min[2], max[0], max[1], max[2]]);
+
+        let ring_count = points.len() as u32;
+        for ring in 0..ring_count.saturating_sub(1) {
+            let curr = ring_base + ring * sides as u32;
+            let next = curr + sides as u32;
+            for side in 0..sides as u32 {
+                let side_next = (side + 1) % sides as u32;
+                indices.extend_from_slice(&[
+                    curr + side,
+                    next + side,
+                    next + side_next,
+                    curr + side,
+                    next + side_next,
+                    curr + side_next,
+                ]);
+            }
+        }
+
+        let start_center = vertices.len() as u32;
+        vertices.push(TubeMeshVertex {
+            position: points[0].position,
+            normal: (-tangents[0]).to_array(),
+            color: points[0].color,
+        });
+        for side in 0..sides as u32 {
+            let side_next = (side + 1) % sides as u32;
+            indices.extend_from_slice(&[start_center, ring_base + side_next, ring_base + side]);
+        }
+
+        let end_center = vertices.len() as u32;
+        let last_ring = ring_base + (ring_count - 1) * sides as u32;
+        let last_point = *points.last().unwrap();
+        let last_tangent = *tangents.last().unwrap();
+        vertices.push(TubeMeshVertex {
+            position: last_point.position,
+            normal: last_tangent.to_array(),
+            color: last_point.color,
+        });
+        for side in 0..sides as u32 {
+            let side_next = (side + 1) % sides as u32;
+            indices.extend_from_slice(&[end_center, last_ring + side, last_ring + side_next]);
+        }
     }
-    aabbs
+
+    (vertices, indices)
+}
+
+pub fn estimate_tube_mesh_bytes_from_offsets<I>(point_counts: I, sides: u32) -> usize
+where
+    I: IntoIterator<Item = usize>,
+{
+    let sides = sides.max(3) as usize;
+    let mut vertices = 0usize;
+    let mut indices = 0usize;
+
+    for point_count in point_counts {
+        if point_count < 2 {
+            continue;
+        }
+        vertices = vertices.saturating_add(point_count.saturating_mul(sides).saturating_add(2));
+        indices = indices.saturating_add(
+            (point_count - 1)
+                .saturating_mul(sides)
+                .saturating_mul(6)
+                .saturating_add(6usize.saturating_mul(sides)),
+        );
+    }
+
+    vertices
+        .saturating_mul(std::mem::size_of::<TubeMeshVertex>())
+        .saturating_add(indices.saturating_mul(std::mem::size_of::<u32>()))
+}
+
+fn compute_streamline_tangents(points: &[TubePoint]) -> Vec<Vec3> {
+    let mut tangents = Vec::with_capacity(points.len());
+
+    for i in 0..points.len() {
+        let tangent = if i == 0 {
+            Vec3::from(points[1].position) - Vec3::from(points[0].position)
+        } else if i + 1 == points.len() {
+            Vec3::from(points[i].position) - Vec3::from(points[i - 1].position)
+        } else {
+            Vec3::from(points[i + 1].position) - Vec3::from(points[i - 1].position)
+        };
+        tangents.push(safe_normalize(tangent));
+    }
+
+    tangents
+}
+
+fn build_parallel_transport_frames(tangents: &[Vec3]) -> Vec<Vec3> {
+    let mut normals = Vec::with_capacity(tangents.len());
+    if tangents.is_empty() {
+        return normals;
+    }
+
+    let mut normal = arbitrary_perpendicular(tangents[0]);
+    normals.push(normal);
+
+    for window in tangents.windows(2) {
+        let prev_t = window[0];
+        let curr_t = window[1];
+        let axis = prev_t.cross(curr_t);
+
+        if axis.length_squared() > 1e-8 {
+            let angle = prev_t.dot(curr_t).clamp(-1.0, 1.0).acos();
+            normal = glam::Quat::from_axis_angle(axis.normalize(), angle) * normal;
+        }
+
+        normal = (normal - curr_t * normal.dot(curr_t)).normalize_or_zero();
+        if normal.length_squared() < 1e-8 {
+            normal = arbitrary_perpendicular(curr_t);
+        }
+        normals.push(normal);
+    }
+
+    normals
+}
+
+fn arbitrary_perpendicular(tangent: Vec3) -> Vec3 {
+    let tangent = safe_normalize(tangent);
+    let reference = if tangent.z.abs() < 0.9 {
+        Vec3::Z
+    } else {
+        Vec3::Y
+    };
+    let perp = tangent.cross(reference);
+    if perp.length_squared() < 1e-8 {
+        Vec3::X
+    } else {
+        perp.normalize()
+    }
+}
+
+fn safe_normalize(v: Vec3) -> Vec3 {
+    let n = v.normalize_or_zero();
+    if n.length_squared() < 1e-8 {
+        Vec3::X
+    } else {
+        n
+    }
 }
 
 /// Expand per-streamline scalar values to per-vertex colors using an explicit range.
 fn expand_dps_to_vertices_ranged(
     dps_values: &[f32],
-    offsets: &[u64],
+    offsets: &[u32],
     nb_vertices: usize,
     min_v: f32,
     max_v: f32,
@@ -787,21 +1008,16 @@ fn expand_dps_to_vertices_ranged(
         if si + 1 < offsets.len() {
             let start = offsets[si] as usize;
             let end = offsets[si + 1] as usize;
-            for vi in start..end.min(nb_vertices) {
-                per_vertex[vi] = val;
+            for vertex_value in per_vertex.iter_mut().take(end.min(nb_vertices)).skip(start) {
+                *vertex_value = val;
             }
         }
     }
     scalar_to_colors_ranged(&per_vertex, min_v, max_v)
 }
 
-fn aabb_overlaps_expanded_surface(aabb: [f32; 6], smin: Vec3, smax: Vec3) -> bool {
-    !(aabb[3] < smin.x
-        || aabb[0] > smax.x
-        || aabb[4] < smin.y
-        || aabb[1] > smax.y
-        || aabb[5] < smin.z
-        || aabb[2] > smax.z)
+fn aabb_overlaps_expanded_surface(aabb: &StreamlineAabb, smin: Vec3, smax: Vec3) -> bool {
+    aabb.overlaps_box(smin.to_array(), smax.to_array())
 }
 
 struct SurfaceSpatialGrid {
@@ -848,5 +1064,55 @@ impl SurfaceSpatialGrid {
             }
         }
         best
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn from_tractogram_preserves_geometry_and_groups() {
+        let mut tractogram = Tractogram::new();
+        tractogram.push_streamline(&[[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]).unwrap();
+        tractogram.push_streamline(&[[7.0, 8.0, 9.0]]).unwrap();
+        tractogram.insert_group("bundle_a", vec![0]);
+
+        let gpu = TrxGpuData::from_tractogram(&tractogram).unwrap();
+        assert_eq!(gpu.nb_streamlines, 2);
+        assert_eq!(gpu.nb_vertices, 3);
+        assert_eq!(gpu.offsets, vec![0, 2, 3]);
+        assert_eq!(gpu.groups.len(), 1);
+        assert_eq!(gpu.groups[0].0, "bundle_a");
+        assert!(gpu.dpv_data.is_empty());
+        assert!(gpu.dps_data.is_empty());
+    }
+
+    #[test]
+    fn imported_dpg_color_overrides_name_palette() {
+        let mut tractogram = Tractogram::new();
+        tractogram.push_streamline(&[[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]).unwrap();
+        tractogram.insert_group("bundle_a", vec![0]);
+        tractogram.insert_dpg(
+            "bundle_a",
+            "color",
+            DataArray::owned_bytes(vec![10, 20, 30], 3, trx_rs::DType::UInt8),
+        );
+
+        let mut gpu = TrxGpuData::from_tractogram(&tractogram).unwrap();
+        gpu.recolor(&ColorMode::Group, None);
+        assert_eq!(gpu.colors[0], [10.0 / 255.0, 20.0 / 255.0, 30.0 / 255.0, 1.0]);
+        assert_eq!(gpu.colors[1], [10.0 / 255.0, 20.0 / 255.0, 30.0 / 255.0, 1.0]);
+    }
+
+    #[test]
+    fn group_name_palette_used_when_no_dpg_color_is_present() {
+        let mut tractogram = Tractogram::new();
+        tractogram.push_streamline(&[[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]).unwrap();
+        tractogram.insert_group("AF_L", vec![0]);
+
+        let mut gpu = TrxGpuData::from_tractogram(&tractogram).unwrap();
+        gpu.recolor(&ColorMode::Group, None);
+        assert_eq!(gpu.colors[0], [0.09, 0.745, 0.812, 1.0]);
     }
 }

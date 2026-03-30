@@ -1,11 +1,13 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use crate::data::bundle_mesh::BundleMesh;
 use crate::data::nifti_data::NiftiVolume;
-use crate::data::trx_data::{ColorMode, RenderStyle, TrxGpuData};
+use crate::data::trx_data::{ColorMode, RenderStyle, TrxGpuData, TubeMeshVertex};
 
 pub type FileId = usize;
+pub type TubeBuildResult = (u64, Vec<TubeMeshVertex>, Vec<u32>);
 
 /// Source for the bundle surface mesh.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -18,16 +20,36 @@ pub enum BundleMeshSource {
     PerGroup,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum BundleMeshColorMode {
+    StreamlineColor,
+    DirectionOrientation,
+    BoundaryField,
+    Constant,
+}
+
+impl BundleMeshColorMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::StreamlineColor => "Streamline color",
+            Self::DirectionOrientation => "Direction orientation",
+            Self::BoundaryField => "Boundary glyph field",
+            Self::Constant => "Constant",
+        }
+    }
+}
+
 /// All per-TRX-file state: data, rendering options, filters, bundle mesh, etc.
 pub struct LoadedTrx {
     pub id: FileId,
     pub name: String,
     pub path: PathBuf,
-    pub data: TrxGpuData,
+    pub data: Arc<TrxGpuData>,
     pub visible: bool,
     pub color_mode: ColorMode,
     pub render_style: RenderStyle,
     pub tube_radius: f32,
+    pub tube_sides: u32,
     pub group_visible: Vec<bool>,
     pub max_streamlines: usize,
     pub use_random_subset: bool,
@@ -38,18 +60,23 @@ pub struct LoadedTrx {
     pub scalar_range_max: f32,
     pub colors_dirty: bool,
     pub indices_dirty: bool,
+    pub tube_mesh_pending: Option<std::sync::mpsc::Receiver<TubeBuildResult>>,
+    pub tube_mesh_dirty_at: Option<std::time::Instant>,
+    pub tube_build_revision: u64,
+    pub index_build_pending: bool,
     pub slab_half_width: f32,
     pub show_bundle_mesh: bool,
     pub bundle_mesh_source: BundleMeshSource,
+    pub bundle_mesh_color_mode: BundleMeshColorMode,
     pub bundle_mesh_voxel_size: f32,
     pub bundle_mesh_threshold: f32,
     pub bundle_mesh_smooth: f32,
     pub bundle_mesh_opacity: f32,
-    pub bundle_mesh_ambient: f32,
     pub bundle_meshes_cpu: Vec<BundleMesh>,
     pub bundle_mesh_pending: Option<std::sync::mpsc::Receiver<Vec<(BundleMesh, String)>>>,
     pub bundle_mesh_dirty_at: Option<std::time::Instant>,
     pub sphere_query_result: Option<HashSet<u32>>,
+    pub include_in_boundary_glyphs: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]

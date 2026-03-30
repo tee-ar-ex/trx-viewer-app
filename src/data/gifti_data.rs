@@ -53,7 +53,10 @@ impl GiftiSurfaceData {
                     .ok_or_else(|| anyhow::anyhow!("DataArray missing Encoding attribute"))?,
             )?;
             let endian = parse_endian(da.attribute("Endian").unwrap_or("LittleEndian"))?;
-            let row_major = parse_row_major(da.attribute("ArrayIndexingOrder").unwrap_or("RowMajorOrder"))?;
+            let row_major = parse_row_major(
+                da.attribute("ArrayIndexingOrder")
+                    .unwrap_or("RowMajorOrder"),
+            )?;
             let dims = parse_dims(da)?;
             let values = parse_data_values(da, datatype, encoding, endian)?;
 
@@ -276,7 +279,10 @@ fn parse_ascii_values(data_text: &str) -> anyhow::Result<Vec<f64>> {
 }
 
 fn decode_binary_payload(data_text: &str, encoding: Encoding) -> anyhow::Result<Vec<u8>> {
-    let compact: String = data_text.chars().filter(|c| !c.is_ascii_whitespace()).collect();
+    let compact: String = data_text
+        .chars()
+        .filter(|c| !c.is_ascii_whitespace())
+        .collect();
     let raw = base64::engine::general_purpose::STANDARD
         .decode(compact.as_bytes())
         .context("Failed to decode Base64 GIFTI data")?;
@@ -359,10 +365,12 @@ fn decode_binary_values(bytes: &[u8], dtype: DataType, endian: Endian) -> anyhow
             for chunk in bytes.chunks_exact(8) {
                 let bits = match endian {
                     Endian::Little => u64::from_le_bytes([
-                        chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
+                        chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6],
+                        chunk[7],
                     ]),
                     Endian::Big => u64::from_be_bytes([
-                        chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
+                        chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6],
+                        chunk[7],
                     ]),
                 };
                 out.push(f64::from_bits(bits));
@@ -372,7 +380,12 @@ fn decode_binary_values(bytes: &[u8], dtype: DataType, endian: Endian) -> anyhow
     Ok(out)
 }
 
-fn reorder_2d(values: &[f64], rows: usize, cols: usize, row_major: bool) -> anyhow::Result<Vec<f32>> {
+fn reorder_2d(
+    values: &[f64],
+    rows: usize,
+    cols: usize,
+    row_major: bool,
+) -> anyhow::Result<Vec<f32>> {
     let expected = rows
         .checked_mul(cols)
         .ok_or_else(|| anyhow::anyhow!("rows*cols overflows for DataArray"))?;
@@ -449,4 +462,3 @@ fn compute_vertex_normals(vertices: &[[f32; 3]], indices: &[u32]) -> Vec<[f32; 3
         .map(|n| n.normalize_or_zero().into())
         .collect()
 }
-

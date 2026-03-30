@@ -6,9 +6,15 @@ use nifti::{IntoNdArray, NiftiObject, ReaderOptions};
 /// Convert NIfTI qform quaternion parameters to a 4x4 voxel-to-RAS affine.
 /// Matches trx-cpp's `quatern_to_mat44` exactly.
 fn quatern_to_mat44(
-    qb: f32, qc: f32, qd: f32,
-    qx: f32, qy: f32, qz: f32,
-    dx: f32, dy: f32, dz: f32,
+    qb: f32,
+    qc: f32,
+    qd: f32,
+    qx: f32,
+    qy: f32,
+    qz: f32,
+    dx: f32,
+    dy: f32,
+    dz: f32,
     qfac: f32,
 ) -> Mat4 {
     let mut a = 1.0f64 - (qb * qb + qc * qc + qd * qd) as f64;
@@ -68,11 +74,21 @@ impl NiftiVolume {
         // Build voxel-to-RAS affine using trx-cpp priority: qform first, then sform.
         // This matches how trx-cpp's read_nifti_voxel_to_rasmm() works.
         let voxel_to_ras = if header.qform_code > 0 {
-            let qfac = if header.pixdim[0] < 0.0 { -1.0f32 } else { 1.0f32 };
+            let qfac = if header.pixdim[0] < 0.0 {
+                -1.0f32
+            } else {
+                1.0f32
+            };
             quatern_to_mat44(
-                header.quatern_b, header.quatern_c, header.quatern_d,
-                header.quatern_x, header.quatern_y, header.quatern_z,
-                header.pixdim[1], header.pixdim[2], header.pixdim[3],
+                header.quatern_b,
+                header.quatern_c,
+                header.quatern_d,
+                header.quatern_x,
+                header.quatern_y,
+                header.quatern_z,
+                header.pixdim[1],
+                header.pixdim[2],
+                header.pixdim[3],
                 qfac,
             )
         } else if header.sform_code > 0 {
@@ -87,7 +103,9 @@ impl NiftiVolume {
                 Vec4::new(sx[3], sy[3], sz[3], 1.0),
             )
         } else {
-            return Err(anyhow::anyhow!("NIfTI header has neither valid qform nor sform code"));
+            return Err(anyhow::anyhow!(
+                "NIfTI header has neither valid qform nor sform code"
+            ));
         };
 
         // Get volume dimensions from header dim array
@@ -138,11 +156,21 @@ impl NiftiVolume {
     /// Compute the half-extents (in world-space mm) for each slice camera axis so the
     /// slice quad fills almost the entire viewport.  Returns [axial, coronal, sagittal].
     pub fn slice_half_extents(&self) -> [f32; 3] {
-        fn quad_half_extent(corners: &[Vec3; 4], a: impl Fn(&Vec3) -> f32, b: impl Fn(&Vec3) -> f32) -> f32 {
+        fn quad_half_extent(
+            corners: &[Vec3; 4],
+            a: impl Fn(&Vec3) -> f32,
+            b: impl Fn(&Vec3) -> f32,
+        ) -> f32 {
             let ca = corners.iter().map(|c| a(c)).sum::<f32>() / 4.0;
             let cb = corners.iter().map(|c| b(c)).sum::<f32>() / 4.0;
-            let ha = corners.iter().map(|c| (a(c) - ca).abs()).fold(0f32, f32::max);
-            let hb = corners.iter().map(|c| (b(c) - cb).abs()).fold(0f32, f32::max);
+            let ha = corners
+                .iter()
+                .map(|c| (a(c) - ca).abs())
+                .fold(0f32, f32::max);
+            let hb = corners
+                .iter()
+                .map(|c| (b(c) - cb).abs())
+                .fold(0f32, f32::max);
             ha.max(hb) * 1.05
         }
         let mid_k = self.dims[2] / 2;

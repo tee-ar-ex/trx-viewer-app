@@ -1,7 +1,10 @@
+use crate::data::orientation_field::BoundaryGlyphColorMode;
+use crate::renderer::glyph_renderer::GlyphResources;
 use crate::data::trx_data::RenderStyle;
 use crate::renderer::mesh_renderer::{MeshDrawStyle, MeshResources};
 use crate::renderer::slice_renderer::AllSliceResources;
 use crate::renderer::streamline_renderer::AllStreamlineResources;
+use super::state::SceneLightingParams;
 
 // ── Paint Callbacks ──
 
@@ -24,7 +27,6 @@ pub(super) struct StreamlineDrawInfo {
 pub(super) struct BundleDrawInfo {
     pub file_id: usize,
     pub opacity: f32,
-    pub ambient: f32,
 }
 
 pub(super) struct Scene3DCallback {
@@ -36,6 +38,10 @@ pub(super) struct Scene3DCallback {
     pub(super) slice_visible: [bool; 3],
     pub(super) surface_draws: Vec<(usize, MeshDrawStyle)>,
     pub(super) bundle_draws: Vec<BundleDrawInfo>,
+    pub(super) show_boundary_glyphs: bool,
+    pub(super) boundary_glyph_color_mode: BoundaryGlyphColorMode,
+    pub(super) boundary_glyph_draw_step: u32,
+    pub(super) scene_lighting: SceneLightingParams,
 }
 
 impl egui_wgpu::CallbackTrait for Scene3DCallback {
@@ -50,16 +56,38 @@ impl egui_wgpu::CallbackTrait for Scene3DCallback {
         if let Some(all) = callback_resources.get_mut::<AllStreamlineResources>() {
             for sd in &self.streamline_draws {
                 if let Some((_, res)) = all.entries.iter().find(|(id, _)| *id == sd.file_id) {
-                    let aux = if sd.render_style == RenderStyle::DepthCue { 300.0 } else { sd.tube_radius };
-                    res.update_uniforms(queue, 0, self.view_proj, self.camera_pos,
-                        sd.render_style as u32, 3, 0.0, 0.0, aux);
+                    let aux = if sd.render_style == RenderStyle::DepthCue {
+                        300.0
+                    } else {
+                        sd.tube_radius
+                    };
+                    res.update_uniforms(
+                        queue,
+                        0,
+                        self.view_proj,
+                        self.camera_pos,
+                        sd.render_style as u32,
+                        3,
+                        0.0,
+                        0.0,
+                        aux,
+                        self.scene_lighting,
+                    );
                 }
             }
         }
         if let Some(all) = callback_resources.get_mut::<AllSliceResources>() {
             for vd in &self.volume_draws {
                 if let Some((_, sr)) = all.entries.iter().find(|(id, _)| *id == vd.file_id) {
-                    sr.update_uniforms(queue, 0, self.view_proj, vd.window_center, vd.window_width, vd.colormap, vd.opacity);
+                    sr.update_uniforms(
+                        queue,
+                        0,
+                        self.view_proj,
+                        vd.window_center,
+                        vd.window_width,
+                        vd.colormap,
+                        vd.opacity,
+                    );
                 }
             }
         }
@@ -72,6 +100,7 @@ impl egui_wgpu::CallbackTrait for Scene3DCallback {
                     self.view_proj,
                     style,
                     self.camera_pos,
+                    self.scene_lighting,
                 );
             }
             for bd in &self.bundle_draws {
@@ -81,7 +110,22 @@ impl egui_wgpu::CallbackTrait for Scene3DCallback {
                     self.view_proj,
                     self.camera_pos,
                     bd.opacity,
-                    bd.ambient,
+                    self.scene_lighting,
+                );
+            }
+        }
+        if self.show_boundary_glyphs {
+            if let Some(gr) = callback_resources.get_mut::<GlyphResources>() {
+                gr.update_uniforms(
+                    queue,
+                    0,
+                    self.view_proj,
+                    3,
+                    0.0,
+                    0.0,
+                    self.boundary_glyph_color_mode,
+                    self.boundary_glyph_draw_step,
+                    self.scene_lighting,
                 );
             }
         }
@@ -117,7 +161,9 @@ impl egui_wgpu::CallbackTrait for Scene3DCallback {
                         wgpu::IndexFormat::Uint16,
                     );
                     for i in 0..3 {
-                        if !self.slice_visible[i] { continue; }
+                        if !self.slice_visible[i] {
+                            continue;
+                        }
                         render_pass.set_vertex_buffer(0, sr.quad_buffers[i].slice(..));
                         render_pass.draw_indexed(0..6, 0, 0..1);
                     }
@@ -131,10 +177,13 @@ impl egui_wgpu::CallbackTrait for Scene3DCallback {
                     if let Some((_, sr)) = all.entries.iter().find(|(id, _)| *id == sd.file_id) {
                         render_pass.set_bind_group(0, &sr.bind_groups[0], &[]);
                         if sd.render_style == RenderStyle::Tubes {
-                            if let (Some(tvb), Some(tib)) = (&sr.tube_vertex_buffer, &sr.tube_index_buffer) {
+                            if let (Some(tvb), Some(tib)) =
+                                (&sr.tube_vertex_buffer, &sr.tube_index_buffer)
+                            {
                                 render_pass.set_pipeline(&sr.tube_pipeline);
                                 render_pass.set_vertex_buffer(0, tvb.slice(..));
-                                render_pass.set_index_buffer(tib.slice(..), wgpu::IndexFormat::Uint32);
+                                render_pass
+                                    .set_index_buffer(tib.slice(..), wgpu::IndexFormat::Uint32);
                                 render_pass.draw_indexed(0..sr.num_tube_indices, 0, 0..1);
                             }
                         } else {
@@ -142,7 +191,10 @@ impl egui_wgpu::CallbackTrait for Scene3DCallback {
                             render_pass.set_vertex_buffer(0, sr.position_buffer.slice(..));
                             render_pass.set_vertex_buffer(1, sr.color_buffer.slice(..));
                             render_pass.set_vertex_buffer(2, sr.tangent_buffer.slice(..));
-                            render_pass.set_index_buffer(sr.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                            render_pass.set_index_buffer(
+                                sr.index_buffer.slice(..),
+                                wgpu::IndexFormat::Uint32,
+                            );
                             render_pass.draw_indexed(0..sr.num_indices, 0, 0..1);
                         }
                     }
@@ -155,7 +207,13 @@ impl egui_wgpu::CallbackTrait for Scene3DCallback {
                 mr.paint(render_pass, 0, &self.surface_draws);
             }
             if !self.bundle_draws.is_empty() {
-                mr.paint_bundle(render_pass);
+                let file_ids: Vec<usize> = self.bundle_draws.iter().map(|d| d.file_id).collect();
+                mr.paint_bundle(render_pass, &file_ids);
+            }
+        }
+        if self.show_boundary_glyphs {
+            if let Some(gr) = callback_resources.get::<GlyphResources>() {
+                gr.paint(render_pass, 0, false);
             }
         }
     }
@@ -172,6 +230,10 @@ pub(super) struct SliceViewCallback {
     pub(super) slab_axis: u32,
     pub(super) slab_min: f32,
     pub(super) slab_max: f32,
+    pub(super) show_boundary_glyphs: bool,
+    pub(super) boundary_glyph_color_mode: BoundaryGlyphColorMode,
+    pub(super) boundary_glyph_draw_step: u32,
+    pub(super) scene_lighting: SceneLightingParams,
 }
 
 impl egui_wgpu::CallbackTrait for SliceViewCallback {
@@ -186,7 +248,15 @@ impl egui_wgpu::CallbackTrait for SliceViewCallback {
         if let Some(all) = callback_resources.get_mut::<AllSliceResources>() {
             for vd in &self.volume_draws {
                 if let Some((_, sr)) = all.entries.iter().find(|(id, _)| *id == vd.file_id) {
-                    sr.update_uniforms(queue, self.bind_group_index, self.view_proj, vd.window_center, vd.window_width, vd.colormap, vd.opacity);
+                    sr.update_uniforms(
+                        queue,
+                        self.bind_group_index,
+                        self.view_proj,
+                        vd.window_center,
+                        vd.window_width,
+                        vd.colormap,
+                        vd.opacity,
+                    );
                 }
             }
         }
@@ -206,8 +276,24 @@ impl egui_wgpu::CallbackTrait for SliceViewCallback {
                         slab_min,
                         slab_max,
                         0.5,
+                        self.scene_lighting,
                     );
                 }
+            }
+        }
+        if self.show_boundary_glyphs {
+            if let Some(gr) = callback_resources.get_mut::<GlyphResources>() {
+                gr.update_uniforms(
+                    queue,
+                    self.bind_group_index,
+                    self.view_proj,
+                    self.slab_axis,
+                    self.slab_min,
+                    self.slab_max,
+                    self.boundary_glyph_color_mode,
+                    self.boundary_glyph_draw_step,
+                    self.scene_lighting,
+                );
             }
         }
         Vec::new()
@@ -256,10 +342,16 @@ impl egui_wgpu::CallbackTrait for SliceViewCallback {
                         render_pass.set_vertex_buffer(0, sr.position_buffer.slice(..));
                         render_pass.set_vertex_buffer(1, sr.color_buffer.slice(..));
                         render_pass.set_vertex_buffer(2, sr.tangent_buffer.slice(..));
-                        render_pass.set_index_buffer(sr.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                        render_pass
+                            .set_index_buffer(sr.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
                         render_pass.draw_indexed(0..sr.num_indices, 0, 0..1);
                     }
                 }
+            }
+        }
+        if self.show_boundary_glyphs {
+            if let Some(gr) = callback_resources.get::<GlyphResources>() {
+                gr.paint(render_pass, self.bind_group_index, true);
             }
         }
     }

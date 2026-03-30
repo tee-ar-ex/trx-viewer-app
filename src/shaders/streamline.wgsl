@@ -7,6 +7,11 @@ struct Uniforms {
     slab_min: f32,
     slab_max: f32,
     tube_radius: f32,
+    ambient_strength: f32,
+    key_strength: f32,
+    fill_strength: f32,
+    headlight_mix: f32,
+    specular_strength: f32,
 }
 
 @group(0) @binding(0) var<uniform> uniforms: Uniforms;
@@ -54,16 +59,24 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     if uniforms.render_style == 1u {
         // Illuminated streamlines (Zoeckler 1996)
         // Diffuse and specular computed from angle between light/view and the tangent.
-        let light_dir = normalize(vec3<f32>(0.6, 0.8, 1.0));
+        let key_dir = normalize(vec3<f32>(0.45, 0.55, 1.0));
+        let fill_dir = normalize(vec3<f32>(-0.7, 0.2, 0.65));
         let t = normalize(in.tangent);
-        let tl = dot(t, light_dir);
-        let diffuse = sqrt(max(0.0, 1.0 - tl * tl));   // sin(angle between t and l)
+        let tk = dot(t, key_dir);
+        let tf = dot(t, fill_dir);
+        let key = sqrt(max(0.0, 1.0 - tk * tk));
+        let fill = sqrt(max(0.0, 1.0 - tf * tf));
 
         let view_dir = normalize(uniforms.camera_pos - in.world_pos);
         let tv = dot(t, view_dir);
-        let specular = pow(sqrt(max(0.0, 1.0 - tv * tv)), 16.0);
+        let head = sqrt(max(0.0, 1.0 - tv * tv));
+        let specular = pow(head, 16.0) * uniforms.specular_strength;
 
-        let lit = 0.35 + 0.55 * diffuse + 0.25 * specular;
+        let lit = uniforms.ambient_strength
+            + uniforms.key_strength * key
+            + uniforms.fill_strength * fill
+            + uniforms.headlight_mix * head
+            + specular;
         return vec4<f32>(in.color.rgb * lit, in.color.a);
 
     } else if uniforms.render_style == 3u {

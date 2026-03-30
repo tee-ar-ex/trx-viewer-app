@@ -15,8 +15,8 @@ struct SliceUniforms {
     view_proj: [[f32; 4]; 4],
     window_center: f32,
     window_width: f32,
-    colormap: u32,    // 0=Grayscale, 1=Hot, 2=Cool, 3=RedYellow, 4=BlueLightblue
-    opacity: f32,     // alpha multiplier
+    colormap: u32, // 0=Grayscale, 1=Hot, 2=Cool, 3=RedYellow, 4=BlueLightblue
+    opacity: f32,  // alpha multiplier
 }
 
 #[derive(Clone, Copy)]
@@ -295,34 +295,19 @@ impl SliceResources {
             SliceAxis::Axial => {
                 let c = volume.axial_slice_corners(slice_index);
                 let w = (slice_index as f32 + 0.5) / self.dims[2] as f32;
-                let tc = [
-                    [0.0, 0.0, w],
-                    [1.0, 0.0, w],
-                    [1.0, 1.0, w],
-                    [0.0, 1.0, w],
-                ];
+                let tc = [[0.0, 0.0, w], [1.0, 0.0, w], [1.0, 1.0, w], [0.0, 1.0, w]];
                 (c, tc)
             }
             SliceAxis::Coronal => {
                 let c = volume.coronal_slice_corners(slice_index);
                 let v = (slice_index as f32 + 0.5) / self.dims[1] as f32;
-                let tc = [
-                    [0.0, v, 0.0],
-                    [1.0, v, 0.0],
-                    [1.0, v, 1.0],
-                    [0.0, v, 1.0],
-                ];
+                let tc = [[0.0, v, 0.0], [1.0, v, 0.0], [1.0, v, 1.0], [0.0, v, 1.0]];
                 (c, tc)
             }
             SliceAxis::Sagittal => {
                 let c = volume.sagittal_slice_corners(slice_index);
                 let u = (slice_index as f32 + 0.5) / self.dims[0] as f32;
-                let tc = [
-                    [u, 0.0, 0.0],
-                    [u, 1.0, 0.0],
-                    [u, 1.0, 1.0],
-                    [u, 0.0, 1.0],
-                ];
+                let tc = [[u, 0.0, 0.0], [u, 1.0, 0.0], [u, 1.0, 1.0], [u, 0.0, 1.0]];
                 (c, tc)
             }
         };
