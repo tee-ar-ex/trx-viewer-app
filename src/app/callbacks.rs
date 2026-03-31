@@ -8,6 +8,7 @@ use crate::renderer::streamline_renderer::AllStreamlineResources;
 
 // ── Paint Callbacks ──
 
+#[derive(Clone)]
 pub(super) struct VolumeDrawInfo {
     pub file_id: usize,
     pub window_center: f32,
@@ -25,6 +26,7 @@ pub(super) struct StreamlineDrawInfo {
     pub slab_half_width: f32,
 }
 
+#[derive(Clone)]
 pub(super) struct BundleDrawInfo {
     pub file_id: usize,
     pub opacity: f32,

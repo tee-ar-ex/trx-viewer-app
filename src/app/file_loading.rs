@@ -25,11 +25,11 @@ use super::workflow::{self, LoadedParcellation, ParcellationAsset, WorkflowAsset
 impl super::TrxViewerApp {
     fn allocate_file_id(&mut self, explicit_id: Option<FileId>) -> FileId {
         if let Some(id) = explicit_id {
-            self.next_file_id = self.next_file_id.max(id + 1);
+            self.scene.next_file_id = self.scene.next_file_id.max(id + 1);
             id
         } else {
-            let id = self.next_file_id;
-            self.next_file_id += 1;
+            let id = self.scene.next_file_id;
+            self.scene.next_file_id += 1;
             id
         }
     }
@@ -40,17 +40,17 @@ impl super::TrxViewerApp {
         add_default_nodes: bool,
         streamline_limit: Option<usize>,
     ) {
-        self.workflow_document.assets.push(asset.clone());
+        self.workflow.document.assets.push(asset.clone());
         if add_default_nodes {
-            let pos = workflow::suggest_asset_branch_origin(&self.workflow_document);
+            let pos = workflow::suggest_asset_branch_origin(&self.workflow.document);
             let branch = workflow::add_default_nodes_for_asset(
-                &mut self.workflow_document,
+                &mut self.workflow.document,
                 &asset,
                 pos,
                 streamline_limit,
             );
-            self.workflow_selection = Some(branch.primary_selection);
-            self.workflow_graph_focus_request = Some(branch.bounds);
+            self.workflow.selection = Some(branch.primary_selection);
+            self.workflow.graph_focus_request = Some(branch.bounds);
         }
     }
 
@@ -199,13 +199,13 @@ impl super::TrxViewerApp {
     ) {
         let LoadedStreamlineSource { data, backing } = source;
         let imported = matches!(backing, StreamlineBacking::Imported(_));
-        let is_first = self.trx_files.is_empty()
-            && self.nifti_files.is_empty()
-            && self.gifti_surfaces.is_empty();
-        self.volume_center = data.center();
-        self.volume_extent = data.extent();
+        let is_first = self.scene.trx_files.is_empty()
+            && self.scene.nifti_files.is_empty()
+            && self.scene.gifti_surfaces.is_empty();
+        self.viewport.volume_center = data.center();
+        self.viewport.volume_extent = data.extent();
         if is_first {
-            self.camera_3d = OrbitCamera::new(self.volume_center, self.volume_extent * 0.8);
+            self.viewport.camera_3d = OrbitCamera::new(self.viewport.volume_center, self.viewport.volume_extent * 0.8);
             self.reset_slice_cameras();
         }
 
@@ -230,10 +230,10 @@ impl super::TrxViewerApp {
         }
 
         if is_first {
-            self.slice_world_offsets = [
-                self.volume_center.z,
-                self.volume_center.y,
-                self.volume_center.x,
+            self.viewport.slice_world_offsets = [
+                self.viewport.volume_center.z,
+                self.viewport.volume_center.y,
+                self.viewport.volume_center.x,
             ];
         }
 
@@ -251,7 +251,7 @@ impl super::TrxViewerApp {
             backing: Some(backing),
         };
 
-        self.trx_files.push(trx);
+        self.scene.trx_files.push(trx);
         if register_workflow_asset {
             let asset = WorkflowAssetDocument::Streamlines {
                 id,
@@ -281,30 +281,30 @@ impl super::TrxViewerApp {
         explicit_id: Option<FileId>,
         register_workflow_asset: bool,
     ) {
-        let first_nifti = self.nifti_files.is_empty();
+        let first_nifti = self.scene.nifti_files.is_empty();
         let slice_indices = [vol.dims[2] / 2, vol.dims[1] / 2, vol.dims[0] / 2];
-        let is_first = self.nifti_files.is_empty()
-            && self.trx_files.is_empty()
-            && self.gifti_surfaces.is_empty();
+        let is_first = self.scene.nifti_files.is_empty()
+            && self.scene.trx_files.is_empty()
+            && self.scene.gifti_surfaces.is_empty();
         if is_first {
-            self.volume_center = vol.voxel_to_world(Vec3::new(
+            self.viewport.volume_center = vol.voxel_to_world(Vec3::new(
                 vol.dims[0] as f32 / 2.0,
                 vol.dims[1] as f32 / 2.0,
                 vol.dims[2] as f32 / 2.0,
             ));
-            self.volume_extent = (vol.voxel_to_world(Vec3::new(
+            self.viewport.volume_extent = (vol.voxel_to_world(Vec3::new(
                 vol.dims[0] as f32,
                 vol.dims[1] as f32,
                 vol.dims[2] as f32,
             )) - vol.voxel_to_world(Vec3::ZERO))
             .length();
-            self.camera_3d = OrbitCamera::new(self.volume_center, self.volume_extent * 0.8);
+            self.viewport.camera_3d = OrbitCamera::new(self.viewport.volume_center, self.viewport.volume_extent * 0.8);
         }
 
         let slice_resources = SliceResources::new(&rs.device, &rs.queue, rs.target_format, &vol);
-        slice_resources.update_slice(&rs.queue, SliceAxis::Axial, self.slice_indices[0], &vol);
-        slice_resources.update_slice(&rs.queue, SliceAxis::Coronal, self.slice_indices[1], &vol);
-        slice_resources.update_slice(&rs.queue, SliceAxis::Sagittal, self.slice_indices[2], &vol);
+        slice_resources.update_slice(&rs.queue, SliceAxis::Axial, self.viewport.slice_indices[0], &vol);
+        slice_resources.update_slice(&rs.queue, SliceAxis::Coronal, self.viewport.slice_indices[1], &vol);
+        slice_resources.update_slice(&rs.queue, SliceAxis::Sagittal, self.viewport.slice_indices[2], &vol);
 
         let id = self.allocate_file_id(explicit_id);
 
@@ -323,13 +323,13 @@ impl super::TrxViewerApp {
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| "volume.nii".to_string());
-        self.nifti_files.push(LoadedNifti {
+        self.scene.nifti_files.push(LoadedNifti {
             id,
             name,
             volume: vol,
             colormap: VolumeColormap::Grayscale,
             opacity: 1.0,
-            z_order: self.nifti_files.len() as i32,
+            z_order: self.scene.nifti_files.len() as i32,
             window_center: 0.5,
             window_width: 1.0,
             visible: true,
@@ -345,10 +345,10 @@ impl super::TrxViewerApp {
             );
         }
         if first_nifti {
-            self.slice_indices = slice_indices;
+            self.viewport.slice_indices = slice_indices;
             self.reset_slice_view();
         } else {
-            self.slices_dirty = false;
+            self.viewport.slices_dirty = false;
         }
         self.error_msg = None;
         self.status_msg = None;
@@ -371,10 +371,10 @@ impl super::TrxViewerApp {
         explicit_id: Option<FileId>,
         register_workflow_asset: bool,
     ) {
-        let first_scene_asset = self.trx_files.is_empty()
-            && self.nifti_files.is_empty()
-            && self.gifti_surfaces.is_empty()
-            && self.parcellations.is_empty();
+        let first_scene_asset = self.scene.trx_files.is_empty()
+            && self.scene.nifti_files.is_empty()
+            && self.scene.gifti_surfaces.is_empty()
+            && self.scene.parcellations.is_empty();
         let id = self.allocate_file_id(explicit_id);
         let mut renderer = rs.renderer.write();
         if renderer.callback_resources.get::<MeshResources>().is_none() {
@@ -399,7 +399,7 @@ impl super::TrxViewerApp {
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| "surface.gii".to_string());
-        self.gifti_surfaces.push(LoadedGiftiSurface {
+        self.scene.gifti_surfaces.push(LoadedGiftiSurface {
             id,
             name,
             path: path.clone(),
@@ -408,6 +408,8 @@ impl super::TrxViewerApp {
             visible: true,
             opacity: 1.0,
             color,
+            outline_color: color,
+            outline_thickness: 1.25,
             show_projection_map: false,
             map_opacity: 1.0,
             map_threshold: 0.0,
@@ -428,11 +430,11 @@ impl super::TrxViewerApp {
             );
         }
         if let Some((center, extent)) = initial_surface_view {
-            self.volume_center = center;
-            self.volume_extent = extent;
-            self.camera_3d = OrbitCamera::new(center, extent * 0.8);
+            self.viewport.volume_center = center;
+            self.viewport.volume_extent = extent;
+            self.viewport.camera_3d = OrbitCamera::new(center, extent * 0.8);
             self.reset_slice_cameras();
-            self.slice_world_offsets = [center.z, center.y, center.x];
+            self.viewport.slice_world_offsets = [center.z, center.y, center.x];
         }
         self.error_msg = None;
         self.status_msg = None;
@@ -458,7 +460,7 @@ impl super::TrxViewerApp {
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| "parcellation.nii.gz".to_string());
-        self.parcellations.push(LoadedParcellation {
+        self.scene.parcellations.push(LoadedParcellation {
             asset: ParcellationAsset {
                 id,
                 name,
@@ -485,27 +487,27 @@ impl super::TrxViewerApp {
 
     pub(super) fn reset_slice_cameras(&mut self) {
         let half_extents = self
-            .nifti_files
+            .scene.nifti_files
             .first()
             .map(|n| n.volume.slice_half_extents())
-            .unwrap_or([self.volume_extent * 0.5; 3]);
-        self.slice_cameras = [
-            OrthoSliceCamera::new(SliceAxis::Axial, self.volume_center, half_extents[0] * 2.0),
+            .unwrap_or([self.viewport.volume_extent * 0.5; 3]);
+        self.viewport.slice_cameras = [
+            OrthoSliceCamera::new(SliceAxis::Axial, self.viewport.volume_center, half_extents[0] * 2.0),
             OrthoSliceCamera::new(
                 SliceAxis::Coronal,
-                self.volume_center,
+                self.viewport.volume_center,
                 half_extents[1] * 2.0,
             ),
             OrthoSliceCamera::new(
                 SliceAxis::Sagittal,
-                self.volume_center,
+                self.viewport.volume_center,
                 half_extents[2] * 2.0,
             ),
         ];
     }
 
     pub(crate) fn reset_slice_view(&mut self) {
-        let Some(nf) = self.nifti_files.first() else {
+        let Some(nf) = self.scene.nifti_files.first() else {
             return;
         };
         let vol = &nf.volume;
@@ -515,13 +517,13 @@ impl super::TrxViewerApp {
             vol.dims[2] as f32 / 2.0,
         ));
         let half_extents = vol.slice_half_extents();
-        self.slice_cameras = [
+        self.viewport.slice_cameras = [
             OrthoSliceCamera::new(SliceAxis::Axial, world_center, half_extents[0] * 2.0),
             OrthoSliceCamera::new(SliceAxis::Coronal, world_center, half_extents[1] * 2.0),
             OrthoSliceCamera::new(SliceAxis::Sagittal, world_center, half_extents[2] * 2.0),
         ];
-        self.slice_world_offsets = [world_center.z, world_center.y, world_center.x];
-        self.slices_dirty = true;
+        self.viewport.slice_world_offsets = [world_center.z, world_center.y, world_center.x];
+        self.viewport.slices_dirty = true;
     }
 
     pub(crate) fn reset_slice_view_to_boundary_field(
@@ -538,11 +540,11 @@ impl super::TrxViewerApp {
         let coronal_extent = size.x.max(size.z);
         let sagittal_extent = size.y.max(size.z);
 
-        self.slice_cameras = [
+        self.viewport.slice_cameras = [
             OrthoSliceCamera::new(SliceAxis::Axial, center, axial_extent),
             OrthoSliceCamera::new(SliceAxis::Coronal, center, coronal_extent),
             OrthoSliceCamera::new(SliceAxis::Sagittal, center, sagittal_extent),
         ];
-        self.slice_world_offsets = [center.z, center.y, center.x];
+        self.viewport.slice_world_offsets = [center.z, center.y, center.x];
     }
 }

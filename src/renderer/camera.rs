@@ -206,4 +206,27 @@ impl OrthoSliceCamera {
             }
         }
     }
+
+    pub fn pan_screen(&mut self, delta_x: f32, delta_y: f32) {
+        let scale = self.half_extent * 0.0025;
+        match self.axis {
+            SliceAxis::Axial => {
+                self.center[0] -= delta_x * scale;
+                self.center[1] += delta_y * scale;
+            }
+            SliceAxis::Coronal => {
+                self.center[0] -= delta_x * scale;
+                self.center[1] += delta_y * scale;
+            }
+            SliceAxis::Sagittal => {
+                self.center[0] += delta_x * scale;
+                self.center[1] += delta_y * scale;
+            }
+        }
+    }
+
+    pub fn zoom(&mut self, delta: f32) {
+        self.half_extent *= 1.0 - delta * 0.1;
+        self.half_extent = self.half_extent.max(0.5);
+    }
 }

@@ -5,67 +5,29 @@ mod state;
 mod ui;
 mod workflow;
 
-use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
 
-use glam::Vec3;
-
-use crate::data::loaded_files::{FileId, LoadedNifti, LoadedTrx};
-use crate::data::orientation_field::BoundaryContactField;
-use crate::renderer::camera::{OrbitCamera, OrthoSliceCamera};
 use crate::renderer::slice_renderer::{AllSliceResources, SliceAxis};
 
 pub(crate) use state::SceneLightingParams as AppSceneLightingParams;
 use state::{
-    ImportDialogState, LoadedGiftiSurface, PendingFileLoad, SceneLightingParams, WorkerMessage,
-    WorkerReceiver, WorkerSender,
+    ImportDialogState, PendingFileLoad, SceneState, ViewportState, WorkerMessage, WorkerReceiver,
+    WorkerSender, WorkflowState,
 };
-use workflow::{
-    LoadedParcellation, StreamlineDisplayRuntime, WorkflowDocument, WorkflowExecutionCache,
-    WorkflowJobKind, WorkflowJobMessage, WorkflowRuntime, WorkflowSelection, default_document,
-};
+use workflow::workflow_job_kind_title;
 
 /// Main application state.
 pub struct TrxViewerApp {
-    pub(crate) trx_files: Vec<LoadedTrx>,
-    pub(crate) nifti_files: Vec<LoadedNifti>,
-    pub(crate) next_file_id: FileId,
-    pub(crate) camera_3d: OrbitCamera,
-    pub(crate) slice_cameras: [OrthoSliceCamera; 3],
-    pub(crate) slice_indices: [usize; 3],
-    pub(crate) slices_dirty: bool,
-    pub(crate) volume_center: Vec3,
-    pub(crate) volume_extent: f32,
+    pub(crate) scene: SceneState,
+    pub(crate) viewport: ViewportState,
+    pub(crate) workflow: WorkflowState,
     pub(crate) error_msg: Option<String>,
     pub(crate) status_msg: Option<String>,
-    pub(crate) gifti_surfaces: Vec<LoadedGiftiSurface>,
-    pub(crate) parcellations: Vec<LoadedParcellation>,
-    pub(crate) slice_visible: [bool; 3],
-    pub(crate) slice_world_offsets: [f32; 3],
     pub(crate) worker_tx: WorkerSender,
     pub(crate) worker_rx: WorkerReceiver,
     pub(crate) next_job_id: u64,
     pub(crate) pending_file_loads: Vec<PendingFileLoad>,
     pub(crate) import_dialog: ImportDialogState,
-    pub(crate) scene_lighting: SceneLightingParams,
-    pub(crate) boundary_field: Option<Arc<BoundaryContactField>>,
-    pub(crate) boundary_field_revision: u64,
-    pub(crate) workflow_document: WorkflowDocument,
-    pub(crate) workflow_runtime: WorkflowRuntime,
-    pub(crate) workflow_selection: Option<WorkflowSelection>,
-    pub(crate) workflow_graph_focus_request: Option<egui::Rect>,
-    pub(crate) workflow_display_runtimes:
-        HashMap<workflow::WorkflowNodeUuid, StreamlineDisplayRuntime>,
-    pub(crate) next_workflow_draw_id: FileId,
-    pub(crate) workflow_project_path: Option<PathBuf>,
-    pub(crate) workflow_node_feedback: HashMap<workflow::WorkflowNodeUuid, String>,
-    pub(crate) workflow_execution_cache: WorkflowExecutionCache,
-    pub(crate) workflow_run_expensive_requested: bool,
-    pub(crate) workflow_run_session_active: bool,
-    pub(crate) workflow_job_tx: std::sync::mpsc::Sender<WorkflowJobMessage>,
-    pub(crate) workflow_job_rx: std::sync::mpsc::Receiver<WorkflowJobMessage>,
-    pub(crate) workflow_jobs_in_flight: HashMap<workflow::WorkflowNodeUuid, (WorkflowJobKind, u64)>,
 }
 
 impl TrxViewerApp {
@@ -160,18 +122,19 @@ impl TrxViewerApp {
             .map(|job| job.label.clone())
             .collect();
 
-        for (node_uuid, (kind, _)) in &self.workflow_jobs_in_flight {
+        for (node_uuid, (kind, _)) in &self.workflow.jobs_in_flight {
             let label = self
-                .workflow_document
+                .workflow
+                .document
                 .graph
                 .node_ids()
                 .find(|(_, node)| node.uuid == *node_uuid)
                 .map(|(_, node)| node.label.clone())
                 .filter(|label| !label.is_empty())
-                .unwrap_or_else(|| workflow::workflow_job_kind_title(*kind).to_string());
+                .unwrap_or_else(|| workflow_job_kind_title(*kind).to_string());
             labels.push(format!(
                 "Building {} for {}",
-                workflow::workflow_job_kind_title(*kind),
+                workflow_job_kind_title(*kind),
                 label
             ));
         }
@@ -205,7 +168,7 @@ impl TrxViewerApp {
 
     /// Returns true if any TRX file is loaded.
     pub(crate) fn has_streamlines(&self) -> bool {
-        !self.trx_files.is_empty()
+        !self.scene.trx_files.is_empty()
     }
 
     fn open_import_dialog(&mut self, path: Option<PathBuf>) {
@@ -223,47 +186,16 @@ impl TrxViewerApp {
         let (worker_tx, worker_rx) = std::sync::mpsc::channel();
         let (workflow_job_tx, workflow_job_rx) = std::sync::mpsc::channel();
         let mut app = Self {
-            trx_files: Vec::new(),
-            nifti_files: Vec::new(),
-            next_file_id: 0,
-            camera_3d: OrbitCamera::new(Vec3::ZERO, 200.0),
-            slice_cameras: [
-                OrthoSliceCamera::new(SliceAxis::Axial, Vec3::ZERO, 200.0),
-                OrthoSliceCamera::new(SliceAxis::Coronal, Vec3::ZERO, 200.0),
-                OrthoSliceCamera::new(SliceAxis::Sagittal, Vec3::ZERO, 200.0),
-            ],
-            slice_indices: [0; 3],
-            slices_dirty: false,
-            volume_center: Vec3::ZERO,
-            volume_extent: 200.0,
+            scene: SceneState::default(),
+            viewport: ViewportState::default(),
+            workflow: WorkflowState::new(workflow_job_tx, workflow_job_rx),
             error_msg: None,
             status_msg: None,
-            gifti_surfaces: Vec::new(),
-            parcellations: Vec::new(),
-            slice_visible: [true; 3],
-            slice_world_offsets: [0.0; 3],
             worker_tx,
             worker_rx,
             next_job_id: 1,
             pending_file_loads: Vec::new(),
             import_dialog: ImportDialogState::default(),
-            scene_lighting: SceneLightingParams::default(),
-            boundary_field: None,
-            boundary_field_revision: 0,
-            workflow_document: default_document(),
-            workflow_runtime: WorkflowRuntime::default(),
-            workflow_selection: None,
-            workflow_graph_focus_request: None,
-            workflow_display_runtimes: HashMap::new(),
-            next_workflow_draw_id: 1_000_000,
-            workflow_project_path: None,
-            workflow_node_feedback: HashMap::new(),
-            workflow_execution_cache: WorkflowExecutionCache::default(),
-            workflow_run_expensive_requested: false,
-            workflow_run_session_active: false,
-            workflow_job_tx,
-            workflow_job_rx,
-            workflow_jobs_in_flight: HashMap::new(),
         };
 
         if cc.wgpu_render_state.is_some() {
@@ -285,35 +217,35 @@ impl eframe::App for TrxViewerApp {
         self.poll_workflow_job_messages();
 
         // Update slice positions if dirty
-        if self.slices_dirty {
+        if self.viewport.slices_dirty {
             if let Some(rs) = frame.wgpu_render_state() {
                 let renderer = rs.renderer.read();
                 if let Some(all) = renderer.callback_resources.get::<AllSliceResources>() {
                     for (file_id, sr) in &all.entries {
-                        if let Some(nf) = self.nifti_files.iter().find(|n| n.id == *file_id) {
+                        if let Some(nf) = self.scene.nifti_files.iter().find(|n| n.id == *file_id) {
                             sr.update_slice(
                                 &rs.queue,
                                 SliceAxis::Axial,
-                                self.slice_indices[0],
+                                self.viewport.slice_indices[0],
                                 &nf.volume,
                             );
                             sr.update_slice(
                                 &rs.queue,
                                 SliceAxis::Coronal,
-                                self.slice_indices[1],
+                                self.viewport.slice_indices[1],
                                 &nf.volume,
                             );
                             sr.update_slice(
                                 &rs.queue,
                                 SliceAxis::Sagittal,
-                                self.slice_indices[2],
+                                self.viewport.slice_indices[2],
                                 &nf.volume,
                             );
                         }
                     }
                 }
             }
-            self.slices_dirty = false;
+            self.viewport.slices_dirty = false;
         }
 
         // ── Handle dropped files ──
@@ -397,6 +329,20 @@ impl eframe::App for TrxViewerApp {
                 self.begin_load_parcellation(path);
             }
         }
+        if menu_action.open_3d_window {
+            self.viewport.window_3d_open = true;
+        }
+        if menu_action.open_2d_window {
+            self.viewport.view_2d.window_open = true;
+        }
+        if menu_action.export_3d_view {
+            self.viewport.export_dialog.open = true;
+            self.viewport.export_dialog.target = state::ExportTarget::View3D;
+        }
+        if menu_action.export_2d_view {
+            self.viewport.export_dialog.open = true;
+            self.viewport.export_dialog.target = state::ExportTarget::View2D;
+        }
         let import_action = ui::import_dialog::show_import_dialog(ctx, &mut self.import_dialog);
         if import_action.import_requested {
             if self.import_dialog.detected_format.is_some_and(|format| {
@@ -418,6 +364,7 @@ impl eframe::App for TrxViewerApp {
         self.refresh_workflow_runtime();
         self.queue_workflow_jobs();
         self.sync_workflow_resources(frame);
+        self.show_viewports(ctx);
         self.show_workspace(ctx, frame);
 
         self.draw_activity_overlay(ctx);

@@ -1,8 +1,6 @@
 use egui_tiles::{Behavior, Tree, UiResponse};
 
-use crate::app::callbacks::{self, BundleDrawInfo, StreamlineDrawInfo, VolumeDrawInfo};
 use crate::app::workflow::{self, WorkflowGraphViewer, WorkflowSelection, WorkspacePane};
-use crate::renderer::mesh_renderer::MeshDrawStyle;
 
 impl super::super::TrxViewerApp {
     pub(in crate::app) fn show_workspace(
@@ -34,12 +32,12 @@ impl super::super::TrxViewerApp {
                 ui.add_space(8.0);
             }
             let mut tree = std::mem::replace(
-                &mut self.workflow_document.workspace,
+                &mut self.workflow.document.workspace,
                 Tree::empty("workflow_workspace"),
             );
             let mut behavior = WorkspaceBehavior { app: self, frame };
             tree.ui(&mut behavior, ui);
-            self.workflow_document.workspace = tree;
+            self.workflow.document.workspace = tree;
         });
     }
 
@@ -47,54 +45,54 @@ impl super::super::TrxViewerApp {
         ui.heading("Assets");
         ui.separator();
 
-        if self.workflow_document.assets.is_empty() {
+        if self.workflow.document.assets.is_empty() {
             ui.small("Open files to populate the graph.");
             return;
         }
 
         egui::ScrollArea::vertical().show(ui, |ui| {
-            for asset in &self.workflow_document.assets {
+            for asset in &self.workflow.document.assets {
                 match asset {
                     workflow::WorkflowAssetDocument::Streamlines { id, path, imported } => {
                         let selected =
-                            self.workflow_selection == Some(WorkflowSelection::Asset(*id));
+                            self.workflow.selection == Some(WorkflowSelection::Asset(*id));
                         let label = if *imported {
                             format!("Streamlines (imported)\n{}", path.display())
                         } else {
                             format!("Streamlines\n{}", path.display())
                         };
                         if ui.selectable_label(selected, label).clicked() {
-                            self.workflow_selection = Some(WorkflowSelection::Asset(*id));
+                            self.workflow.selection = Some(WorkflowSelection::Asset(*id));
                         }
                     }
                     workflow::WorkflowAssetDocument::Volume { id, path } => {
                         let selected =
-                            self.workflow_selection == Some(WorkflowSelection::Asset(*id));
+                            self.workflow.selection == Some(WorkflowSelection::Asset(*id));
                         if ui
                             .selectable_label(selected, format!("Volume\n{}", path.display()))
                             .clicked()
                         {
-                            self.workflow_selection = Some(WorkflowSelection::Asset(*id));
+                            self.workflow.selection = Some(WorkflowSelection::Asset(*id));
                         }
                     }
                     workflow::WorkflowAssetDocument::Surface { id, path } => {
                         let selected =
-                            self.workflow_selection == Some(WorkflowSelection::Asset(*id));
+                            self.workflow.selection == Some(WorkflowSelection::Asset(*id));
                         if ui
                             .selectable_label(selected, format!("Surface\n{}", path.display()))
                             .clicked()
                         {
-                            self.workflow_selection = Some(WorkflowSelection::Asset(*id));
+                            self.workflow.selection = Some(WorkflowSelection::Asset(*id));
                         }
                     }
                     workflow::WorkflowAssetDocument::Parcellation { id, path, .. } => {
                         let selected =
-                            self.workflow_selection == Some(WorkflowSelection::Asset(*id));
+                            self.workflow.selection == Some(WorkflowSelection::Asset(*id));
                         if ui
                             .selectable_label(selected, format!("Parcellation\n{}", path.display()))
                             .clicked()
                         {
-                            self.workflow_selection = Some(WorkflowSelection::Asset(*id));
+                            self.workflow.selection = Some(WorkflowSelection::Asset(*id));
                         }
                     }
                 }
@@ -104,32 +102,32 @@ impl super::super::TrxViewerApp {
     }
 
     fn show_graph_pane(&mut self, ui: &mut egui::Ui) {
-        workflow::ensure_node_uuids(&mut self.workflow_document);
+        workflow::ensure_node_uuids(&mut self.workflow.document);
         ui.horizontal(|ui| {
             if ui.button("Run Expensive Nodes").clicked() {
-                self.workflow_run_expensive_requested = true;
+                self.workflow.run_expensive_requested = true;
                 ui.ctx().request_repaint();
             }
-            if self.workflow_run_expensive_requested {
+            if self.workflow.run_expensive_requested {
                 ui.small("Will run on the next graph refresh.");
             }
         });
         ui.separator();
         let mut viewer = WorkflowGraphViewer {
-            selected: &mut self.workflow_selection,
-            focus_bounds: &mut self.workflow_graph_focus_request,
+            selected: &mut self.workflow.selection,
+            focus_bounds: &mut self.workflow.graph_focus_request,
             viewport_rect: ui.max_rect(),
-            node_state: &self.workflow_runtime.node_state,
+            node_state: &self.workflow.runtime.node_state,
         };
         egui_snarl::ui::SnarlWidget::new()
             .id(egui::Id::new("workflow_graph"))
-            .show(&mut self.workflow_document.graph, &mut viewer, ui);
+            .show(&mut self.workflow.document.graph, &mut viewer, ui);
 
         let selected_nodes =
             egui_snarl::ui::get_selected_nodes(egui::Id::new("workflow_graph"), ui.ctx());
         if let Some(node_id) = selected_nodes.first().copied() {
-            self.workflow_selection = Some(WorkflowSelection::Node(
-                self.workflow_document.graph[node_id].uuid,
+            self.workflow.selection = Some(WorkflowSelection::Node(
+                self.workflow.document.graph[node_id].uuid,
             ));
         }
     }
@@ -138,12 +136,12 @@ impl super::super::TrxViewerApp {
         ui.heading("Inspector");
         ui.separator();
 
-        match self.workflow_selection {
+        match self.workflow.selection {
             Some(WorkflowSelection::Asset(asset_id)) => self.show_asset_inspector(ui, asset_id),
             Some(WorkflowSelection::Node(node_uuid)) => self.show_node_inspector(ui, node_uuid),
             None => {
                 ui.small("Select an asset or node.");
-                if let Some(error) = &self.workflow_runtime.graph_error {
+                if let Some(error) = &self.workflow.runtime.graph_error {
                     ui.separator();
                     ui.colored_label(egui::Color32::RED, error);
                 }
@@ -152,7 +150,7 @@ impl super::super::TrxViewerApp {
     }
 
     fn show_asset_inspector(&mut self, ui: &mut egui::Ui, asset_id: usize) {
-        if let Some(trx) = self.trx_files.iter().find(|asset| asset.id == asset_id) {
+        if let Some(trx) = self.scene.trx_files.iter().find(|asset| asset.id == asset_id) {
             ui.strong(&trx.name);
             ui.label(trx.path.display().to_string());
             ui.separator();
@@ -164,7 +162,7 @@ impl super::super::TrxViewerApp {
             ));
             return;
         }
-        if let Some(volume) = self.nifti_files.iter().find(|asset| asset.id == asset_id) {
+        if let Some(volume) = self.scene.nifti_files.iter().find(|asset| asset.id == asset_id) {
             ui.strong(&volume.name);
             ui.label(format!(
                 "Dims: {} x {} x {}",
@@ -173,8 +171,8 @@ impl super::super::TrxViewerApp {
             return;
         }
         if let Some(surface) = self
-            .gifti_surfaces
-            .iter()
+            .scene.gifti_surfaces
+            .iter_mut()
             .find(|asset| asset.id == asset_id)
         {
             ui.strong(&surface.name);
@@ -188,7 +186,7 @@ impl super::super::TrxViewerApp {
             return;
         }
         if let Some(parcel) = self
-            .parcellations
+            .scene.parcellations
             .iter()
             .find(|asset| asset.asset.id == asset_id)
         {
@@ -216,7 +214,7 @@ impl super::super::TrxViewerApp {
 
     fn show_node_inspector(&mut self, ui: &mut egui::Ui, node_uuid: workflow::WorkflowNodeUuid) {
         let Some((node_id, _)) = self
-            .workflow_document
+            .workflow.document
             .graph
             .node_ids()
             .find(|(_, node)| node.uuid == node_uuid)
@@ -226,7 +224,7 @@ impl super::super::TrxViewerApp {
         };
 
         let mut save_now = false;
-        let node = &mut self.workflow_document.graph[node_id];
+        let node = &mut self.workflow.document.graph[node_id];
         ui.text_edit_singleline(&mut node.label);
         ui.separator();
 
@@ -350,6 +348,8 @@ impl super::super::TrxViewerApp {
             workflow::WorkflowNodeKind::SurfaceDisplay {
                 color,
                 opacity,
+                outline_color,
+                outline_thickness,
                 show_projection_map,
                 map_opacity,
                 map_threshold,
@@ -358,8 +358,14 @@ impl super::super::TrxViewerApp {
                 range_min,
                 range_max,
             } => {
+                ui.label("Surface");
                 ui.color_edit_button_rgb(color);
                 ui.add(egui::Slider::new(opacity, 0.0..=1.0).text("Opacity"));
+                ui.separator();
+                ui.label("Slice outline");
+                ui.color_edit_button_rgb(outline_color);
+                ui.add(egui::Slider::new(outline_thickness, 0.25..=8.0).text("Thickness"));
+                ui.separator();
                 ui.checkbox(show_projection_map, "Show surface map");
                 ui.add(egui::Slider::new(map_opacity, 0.0..=1.0).text("Map opacity"));
                 ui.add(egui::Slider::new(map_threshold, 0.0..=1.0).text("Map threshold"));
@@ -413,7 +419,10 @@ impl super::super::TrxViewerApp {
                 );
                 ui.add(egui::Slider::new(opacity, 0.0..=1.0).text("Opacity"));
             }
-            workflow::WorkflowNodeKind::BundleSurfaceDisplay { color_mode } => {
+            workflow::WorkflowNodeKind::BundleSurfaceDisplay {
+                color_mode,
+                outline_thickness,
+            } => {
                 egui::ComboBox::from_id_salt(format!("bundle_surface_color_mode_{}", node_uuid.0))
                     .selected_text(color_mode.label())
                     .show_ui(ui, |ui| {
@@ -428,6 +437,9 @@ impl super::super::TrxViewerApp {
                             workflow::BundleSurfaceColorMode::BoundaryField.label(),
                         );
                     });
+                ui.separator();
+                ui.label("Slice outline");
+                ui.add(egui::Slider::new(outline_thickness, 0.25..=8.0).text("Thickness"));
             }
             workflow::WorkflowNodeKind::BoundaryFieldBuild {
                 voxel_size_mm,
@@ -523,7 +535,7 @@ impl super::super::TrxViewerApp {
                     }
                 });
                 let ready = self
-                    .workflow_runtime
+                    .workflow.runtime
                     .save_streamline_targets
                     .contains_key(&node_uuid);
                 if ui
@@ -541,7 +553,7 @@ impl super::super::TrxViewerApp {
             }
         }
 
-        if let Some(state) = self.workflow_runtime.node_state.get(&node_uuid) {
+        if let Some(state) = self.workflow.runtime.node_state.get(&node_uuid) {
             ui.separator();
             ui.small(&state.summary);
             if let Some(execution) = &state.execution {
@@ -558,7 +570,7 @@ impl super::super::TrxViewerApp {
             }
         }
 
-        if let Some(message) = self.workflow_node_feedback.get(&node_uuid) {
+        if let Some(message) = self.workflow.node_feedback.get(&node_uuid) {
             ui.separator();
             ui.colored_label(egui::Color32::from_rgb(96, 210, 128), message);
         }
@@ -569,269 +581,15 @@ impl super::super::TrxViewerApp {
     }
 
     fn show_preview_pane(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        if self.trx_files.is_empty()
-            && self.nifti_files.is_empty()
-            && self.gifti_surfaces.is_empty()
-            && self.parcellations.is_empty()
-        {
-            ui.centered_and_justified(|ui| {
-                ui.label("Open files or load a project to begin.");
-            });
-            return;
-        }
-
-        let available = ui.available_size();
-        let any_slice_visible = self.slice_visible.iter().any(|&v| v);
-        let top_height = if any_slice_visible {
-            (available.y * 0.6).max(100.0)
-        } else {
-            available.y
-        };
-        let bottom_height = if any_slice_visible {
-            (available.y - top_height - ui.spacing().item_spacing.y).max(50.0)
-        } else {
-            0.0
-        };
-
-        let (rect_3d, response_3d) = ui.allocate_exact_size(
-            egui::vec2(available.x, top_height),
-            egui::Sense::click_and_drag(),
-        );
-
-        if response_3d.dragged_by(egui::PointerButton::Primary) {
-            let delta = ui.input(|i| i.pointer.delta());
-            self.camera_3d.handle_drag(delta.x, delta.y);
-        }
-        if response_3d.dragged_by(egui::PointerButton::Middle) {
-            let delta = ui.input(|i| i.pointer.delta());
-            self.camera_3d.pan_screen(delta.x, delta.y);
-        }
-        if response_3d.dragged_by(egui::PointerButton::Secondary) {
-            let delta = ui.input(|i| i.pointer.delta());
-            self.camera_3d.handle_zoom_drag(delta.x, delta.y);
-        }
-        if response_3d.hovered() {
-            let scroll = ui.input(|i| i.smooth_scroll_delta.y);
-            if scroll != 0.0 {
-                self.camera_3d.handle_scroll(scroll * 0.01);
-            }
-        }
-
-        let aspect_3d = rect_3d.width() / rect_3d.height().max(1.0);
-        let vp_3d = self.camera_3d.view_projection(aspect_3d);
-
-        let surface_draws: Vec<(usize, MeshDrawStyle)> = self
-            .workflow_runtime
-            .scene_plan
-            .surface_draws
-            .iter()
-            .map(|draw| {
-                (
-                    draw.gpu_index,
-                    MeshDrawStyle {
-                        color: [draw.color[0], draw.color[1], draw.color[2], draw.opacity],
-                        scalar_min: draw.range_min,
-                        scalar_max: draw.range_max,
-                        scalar_enabled: draw.show_projection_map,
-                        colormap: draw.projection_colormap,
-                        gloss: draw.gloss,
-                        map_opacity: draw.map_opacity,
-                        map_threshold: draw.map_threshold,
-                    },
-                )
-            })
-            .collect();
-
-        let volume_draws: Vec<VolumeDrawInfo> = self
-            .workflow_runtime
-            .scene_plan
-            .volume_draws
-            .iter()
-            .map(|draw| VolumeDrawInfo {
-                file_id: draw.source_id,
-                window_center: draw.window_center,
-                window_width: draw.window_width,
-                colormap: draw.colormap.as_u32(),
-                opacity: draw.opacity,
-            })
-            .collect();
-
-        let streamline_draws: Vec<StreamlineDrawInfo> = self
-            .workflow_runtime
-            .scene_plan
-            .streamline_draws
-            .iter()
-            .map(|draw| StreamlineDrawInfo {
-                file_id: draw.draw_id,
-                visible: draw.visible,
-                render_style: draw.render_style,
-                tube_radius: draw.tube_radius_mm,
-                slab_half_width: draw.slab_half_width_mm,
-            })
-            .collect();
-
-        let bundle_draws: Vec<BundleDrawInfo> = self
-            .workflow_runtime
-            .scene_plan
-            .bundle_draws
-            .iter()
-            .map(|draw| BundleDrawInfo {
-                file_id: draw.draw_id,
-                opacity: draw.opacity,
-            })
-            .collect();
-
-        let any_visible_streamlines = streamline_draws.iter().any(|draw| draw.visible);
-        let glyph_draw = self
-            .workflow_runtime
-            .scene_plan
-            .boundary_glyph_draws
-            .iter()
-            .find(|draw| draw.visible);
-        let glyph_visible = glyph_draw.is_some() && self.boundary_field.is_some();
-        let glyph_color_mode = glyph_draw
-            .map(|draw| draw.color_mode)
-            .unwrap_or(crate::data::orientation_field::BoundaryGlyphColorMode::DirectionRgb);
-        let glyph_density_3d_step = glyph_draw
-            .map(|draw| draw.density_3d_step as u32)
-            .unwrap_or(1);
-        let glyph_slice_density_step = glyph_draw
-            .map(|draw| draw.slice_density_step as u32)
-            .unwrap_or(1);
-
-        ui.painter().add(egui_wgpu::Callback::new_paint_callback(
-            rect_3d,
-            callbacks::Scene3DCallback {
-                view_proj: vp_3d,
-                camera_pos: self.camera_3d.eye(),
-                camera_dir: self.camera_3d.view_direction(),
-                streamline_draws: streamline_draws.clone(),
-                show_streamlines: any_visible_streamlines,
-                volume_draws,
-                slice_visible: self.slice_visible,
-                surface_draws,
-                bundle_draws,
-                show_boundary_glyphs: glyph_visible,
-                boundary_glyph_color_mode: glyph_color_mode,
-                boundary_glyph_draw_step: glyph_density_3d_step,
-                scene_lighting: self.scene_lighting,
-            },
-        ));
-
-        self.draw_3d_axes(ui, rect_3d, vp_3d);
-
-        let visible_slice_indices: Vec<usize> = self
-            .slice_visible
-            .iter()
-            .enumerate()
-            .filter_map(|(i, visible)| visible.then_some(i))
-            .collect();
-        if visible_slice_indices.is_empty() {
-            return;
-        }
-
-        let count = visible_slice_indices.len() as f32;
-        let spacing = ui.spacing().item_spacing.x * (count - 1.0).max(0.0);
-        let slice_width = ((available.x - spacing) / count).max(10.0);
-        let slice_height = (bottom_height - ui.spacing().item_spacing.y - 18.0).max(10.0);
-
+        ui.heading("Viewers Moved");
+        ui.separator();
+        ui.label("3D and 2D views now live in separate windows.");
         ui.horizontal(|ui| {
-            let axis_names = ["Axial", "Coronal", "Sagittal"];
-            let axis_labels = ["Z", "Y", "X"];
-            for &i in &visible_slice_indices {
-                ui.vertical(|ui| {
-                    let pos_mm = self.slice_world_position(i);
-                    ui.horizontal(|ui| {
-                        ui.checkbox(&mut self.slice_visible[i], "");
-                        ui.label(format!(
-                            "{} ({} = {:.1} mm)",
-                            axis_names[i], axis_labels[i], pos_mm
-                        ));
-                    });
-
-                    let (rect, response) = ui.allocate_exact_size(
-                        egui::vec2(slice_width, slice_height),
-                        egui::Sense::click_and_drag(),
-                    );
-
-                    if response.hovered() {
-                        let scroll = ui.input(|inp| inp.smooth_scroll_delta.y);
-                        if scroll.abs() > 0.5 {
-                            let delta = if scroll > 0.0 { 1isize } else { -1 };
-                            self.step_slice(i, delta);
-                        }
-                    }
-
-                    let aspect = rect.width() / rect.height().max(1.0);
-                    let slice_pos = self.slice_world_position(i);
-                    let vp_slice = self.slice_cameras[i].view_projection(aspect, slice_pos);
-                    let glyph_slab_half_width = self
-                        .boundary_field
-                        .as_ref()
-                        .map(|field| 0.5 * field.grid.voxel_size_mm)
-                        .unwrap_or(0.0);
-
-                    let slab_axis = match i {
-                        0 => 2u32,
-                        1 => 1u32,
-                        _ => 0u32,
-                    };
-
-                    let slice_volume_draws: Vec<VolumeDrawInfo> = self
-                        .workflow_runtime
-                        .scene_plan
-                        .volume_draws
-                        .iter()
-                        .map(|draw| VolumeDrawInfo {
-                            file_id: draw.source_id,
-                            window_center: draw.window_center,
-                            window_width: draw.window_width,
-                            colormap: draw.colormap.as_u32(),
-                            opacity: draw.opacity,
-                        })
-                        .collect();
-
-                    let slice_streamline_draws: Vec<StreamlineDrawInfo> = self
-                        .workflow_runtime
-                        .scene_plan
-                        .streamline_draws
-                        .iter()
-                        .map(|draw| StreamlineDrawInfo {
-                            file_id: draw.draw_id,
-                            visible: draw.visible,
-                            render_style: draw.render_style,
-                            tube_radius: draw.tube_radius_mm,
-                            slab_half_width: draw.slab_half_width_mm,
-                        })
-                        .collect();
-                    let slice_show_streamlines =
-                        slice_streamline_draws.iter().any(|draw| draw.visible);
-
-                    ui.painter().add(egui_wgpu::Callback::new_paint_callback(
-                        rect,
-                        callbacks::SliceViewCallback {
-                            view_proj: vp_slice,
-                            quad_index: i,
-                            bind_group_index: i + 1,
-                            volume_draws: slice_volume_draws,
-                            streamline_draws: slice_streamline_draws,
-                            show_streamlines: slice_show_streamlines,
-                            slab_axis,
-                            slab_min: slice_pos - glyph_slab_half_width,
-                            slab_max: slice_pos + glyph_slab_half_width,
-                            show_boundary_glyphs: glyph_visible,
-                            boundary_glyph_color_mode: glyph_color_mode,
-                            boundary_glyph_draw_step: glyph_slice_density_step,
-                            scene_lighting: self.scene_lighting,
-                        },
-                    ));
-
-                    self.draw_crosshairs(ui, rect, i, vp_slice);
-                    self.draw_orientation_labels(ui, rect, i, vp_slice);
-                    self.draw_mesh_intersections(ui, rect, i, vp_slice, slice_pos);
-                    self.draw_bundle_mesh_intersections(ui, rect, i, vp_slice, slice_pos);
-                    self.draw_parcellation_intersections(ui, rect, i, vp_slice, slice_pos);
-                });
+            if ui.button("Open 3D Window").clicked() {
+                self.viewport.window_3d_open = true;
+            }
+            if ui.button("Open 2D Window").clicked() {
+                self.viewport.view_2d.window_open = true;
             }
         });
     }

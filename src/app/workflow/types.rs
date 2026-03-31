@@ -1,0 +1,912 @@
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::hash::Hasher;
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use egui::Rect;
+use egui_snarl::Snarl;
+use egui_tiles::{Container, Linear, LinearDir, Tile, Tiles, Tree};
+
+use crate::data::bundle_mesh::BundleMesh;
+use crate::data::gifti_data::GiftiSurfaceData;
+use crate::data::loaded_files::{FileId, LoadedNifti, LoadedTrx, StreamlineBacking, VolumeColormap};
+use crate::data::orientation_field::{
+    BoundaryContactField, BoundaryGlyphColorMode, BoundaryGlyphNormalization,
+};
+use crate::data::parcellation_data::ParcellationVolume;
+use crate::data::trx_data::{ColorMode, RenderStyle, TrxGpuData};
+use crate::renderer::mesh_renderer::SurfaceColormap;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct WorkflowNodeUuid(pub u64);
+
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct WorkflowNode {
+    pub uuid: WorkflowNodeUuid,
+    pub kind: WorkflowNodeKind,
+    pub label: String,
+}
+
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum WorkflowNodeKind {
+    StreamlineSource {
+        source_id: FileId,
+    },
+    VolumeSource {
+        source_id: FileId,
+    },
+    SurfaceSource {
+        source_id: FileId,
+    },
+    ParcellationSource {
+        source_id: FileId,
+    },
+    LimitStreamlines {
+        limit: usize,
+        randomize: bool,
+        seed: u64,
+    },
+    GroupSelect {
+        groups_csv: String,
+    },
+    RandomSubset {
+        limit: usize,
+        seed: u64,
+    },
+    SphereQuery {
+        center: [f32; 3],
+        radius_mm: f32,
+    },
+    SurfaceDepthQuery {
+        depth_mm: f32,
+    },
+    RemoveDuplicates,
+    Merge,
+    AddGroupsFromParcellation,
+    ParcelSelect {
+        labels_csv: String,
+    },
+    ParcelROI,
+    ParcelROA,
+    ParcelEnd {
+        endpoint_count: usize,
+    },
+    ParcelLimiting,
+    ParcelTerminative,
+    ParcelSurfaceBuild,
+    ColorByDirection,
+    ColorByGroup,
+    ColorByDPV {
+        field: String,
+    },
+    ColorByDPS {
+        field: String,
+    },
+    UniformColor {
+        color: [f32; 4],
+    },
+    SurfaceProjectionDensity {
+        depth_mm: f32,
+    },
+    SurfaceProjectionMeanDps {
+        depth_mm: f32,
+        field: String,
+    },
+    BundleSurfaceBuild {
+        #[serde(default)]
+        per_group: bool,
+        voxel_size_mm: f32,
+        threshold: f32,
+        smooth_sigma: f32,
+        opacity: f32,
+    },
+    BoundaryFieldBuild {
+        #[serde(default = "default_boundary_field_voxel_size_mm")]
+        voxel_size_mm: f32,
+        #[serde(default = "default_boundary_field_sphere_lod")]
+        sphere_lod: u32,
+        #[serde(default = "default_boundary_field_normalization")]
+        normalization: BoundaryGlyphNormalization,
+    },
+    StreamlineDisplay {
+        #[serde(default = "default_enabled")]
+        enabled: bool,
+        render_style: RenderStyle,
+        tube_radius_mm: f32,
+        tube_sides: u32,
+        slab_half_width_mm: f32,
+    },
+    VolumeDisplay {
+        colormap: VolumeColormap,
+        opacity: f32,
+        window_center: f32,
+        window_width: f32,
+    },
+    SurfaceDisplay {
+        color: [f32; 3],
+        opacity: f32,
+        outline_color: [f32; 3],
+        outline_thickness: f32,
+        show_projection_map: bool,
+        map_opacity: f32,
+        map_threshold: f32,
+        gloss: f32,
+        projection_colormap: SurfaceColormap,
+        range_min: f32,
+        range_max: f32,
+    },
+    BundleSurfaceDisplay {
+        #[serde(default)]
+        color_mode: BundleSurfaceColorMode,
+        #[serde(default = "default_bundle_surface_outline_thickness")]
+        outline_thickness: f32,
+    },
+    BoundaryGlyphDisplay {
+        #[serde(default = "default_enabled")]
+        enabled: bool,
+        #[serde(default = "default_boundary_glyph_scale")]
+        scale: f32,
+        #[serde(default = "default_boundary_glyph_density_3d_step")]
+        density_3d_step: usize,
+        #[serde(default = "default_boundary_glyph_slice_density_step")]
+        slice_density_step: usize,
+        #[serde(default = "default_boundary_glyph_color_mode")]
+        color_mode: BoundaryGlyphColorMode,
+        #[serde(default = "default_boundary_glyph_min_contacts")]
+        min_contacts: u32,
+    },
+    ParcellationDisplay {
+        labels_csv: String,
+        opacity: f32,
+    },
+    SaveStreamlines {
+        output_path: String,
+    },
+}
+
+pub fn default_enabled() -> bool {
+    true
+}
+
+pub fn default_boundary_field_voxel_size_mm() -> f32 {
+    3.0
+}
+
+pub fn default_boundary_field_sphere_lod() -> u32 {
+    12
+}
+
+pub fn default_boundary_field_normalization() -> BoundaryGlyphNormalization {
+    BoundaryGlyphNormalization::GlobalPeak
+}
+
+pub fn default_boundary_glyph_scale() -> f32 {
+    2.0
+}
+
+pub fn default_boundary_glyph_density_3d_step() -> usize {
+    2
+}
+
+pub fn default_boundary_glyph_slice_density_step() -> usize {
+    1
+}
+
+pub fn default_boundary_glyph_color_mode() -> BoundaryGlyphColorMode {
+    BoundaryGlyphColorMode::DirectionRgb
+}
+
+pub fn default_boundary_glyph_min_contacts() -> u32 {
+    1
+}
+
+pub fn default_bundle_surface_outline_thickness() -> f32 {
+    1.15
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct WorkflowDocument {
+    pub next_node_uuid: u64,
+    pub graph: Snarl<WorkflowNode>,
+    pub workspace: Tree<WorkspacePane>,
+    pub assets: Vec<WorkflowAssetDocument>,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct WorkflowProject {
+    pub version: u32,
+    pub document: WorkflowDocument,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub enum WorkflowAssetDocument {
+    Streamlines {
+        id: FileId,
+        path: PathBuf,
+        imported: bool,
+    },
+    Volume {
+        id: FileId,
+        path: PathBuf,
+    },
+    Surface {
+        id: FileId,
+        path: PathBuf,
+    },
+    Parcellation {
+        id: FileId,
+        path: PathBuf,
+        label_table_path: Option<PathBuf>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum WorkspacePane {
+    Assets,
+    Preview,
+    Graph,
+    Inspector,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct NodeEvalState {
+    pub summary: String,
+    pub error: Option<String>,
+    pub execution: Option<WorkflowExecutionStatus>,
+    pub fingerprint: Option<u64>,
+    pub last_result_summary: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WorkflowExecutionStatus {
+    NeverRun,
+    Stale,
+    Queued,
+    Running,
+    Ready,
+    Failed(String),
+}
+
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
+)]
+pub enum BundleSurfaceColorMode {
+    #[default]
+    Solid,
+    BoundaryField,
+}
+
+impl BundleSurfaceColorMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Solid => "Solid",
+            Self::BoundaryField => "Boundary field",
+        }
+    }
+}
+
+impl WorkflowExecutionStatus {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::NeverRun => "Run required",
+            Self::Stale => "Stale",
+            Self::Queued => "Queued",
+            Self::Running => "Running",
+            Self::Ready => "Ready",
+            Self::Failed(_) => "Failed",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ExpensiveNodeRunRecord {
+    pub current_fingerprint: Option<u64>,
+    pub last_success_fingerprint: Option<u64>,
+    pub status: WorkflowExecutionStatus,
+    pub last_result_summary: Option<String>,
+}
+
+impl Default for ExpensiveNodeRunRecord {
+    fn default() -> Self {
+        Self {
+            current_fingerprint: None,
+            last_success_fingerprint: None,
+            status: WorkflowExecutionStatus::NeverRun,
+            last_result_summary: None,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct CachedSurfaceQuery {
+    pub fingerprint: u64,
+    pub flow: StreamlineFlow,
+}
+
+#[derive(Clone)]
+pub struct CachedDerivedStreamline {
+    pub fingerprint: u64,
+    pub flow: StreamlineFlow,
+}
+
+#[derive(Clone)]
+pub struct CachedSurfaceStreamlineMap {
+    pub fingerprint: u64,
+    pub map: SurfaceStreamlineMap,
+}
+
+#[derive(Clone)]
+pub struct CachedBoundaryField {
+    pub fingerprint: u64,
+    pub field: Arc<BoundaryContactField>,
+}
+
+#[derive(Clone)]
+pub struct CachedTubeGeometry {
+    pub fingerprint: u64,
+    pub vertices: Vec<crate::data::trx_data::TubeMeshVertex>,
+    pub indices: Vec<u32>,
+}
+
+#[derive(Clone)]
+pub struct CachedBundleSurfaceMeshes {
+    pub fingerprint: u64,
+    pub meshes: Vec<(BundleMesh, String)>,
+}
+
+#[derive(Clone, Default)]
+pub struct WorkflowExecutionCache {
+    pub node_runs: HashMap<WorkflowNodeUuid, ExpensiveNodeRunRecord>,
+    pub derived_streamline_cache: HashMap<WorkflowNodeUuid, CachedDerivedStreamline>,
+    pub surface_query_cache: HashMap<WorkflowNodeUuid, CachedSurfaceQuery>,
+    pub surface_streamline_map_cache: HashMap<WorkflowNodeUuid, CachedSurfaceStreamlineMap>,
+    pub tube_geometry_cache: HashMap<WorkflowNodeUuid, CachedTubeGeometry>,
+    pub bundle_surface_mesh_cache: HashMap<WorkflowNodeUuid, CachedBundleSurfaceMeshes>,
+    pub boundary_field_cache: HashMap<WorkflowNodeUuid, CachedBoundaryField>,
+}
+
+#[derive(Clone)]
+pub struct SceneFramePlan {
+    pub reactive_streamline_plans: Vec<ReactiveStreamlinePlan>,
+    pub surface_query_plans: Vec<SurfaceQueryPlan>,
+    pub surface_map_plans: Vec<SurfaceMapPlan>,
+    pub streamline_draws: Vec<StreamlineDrawPlan>,
+    pub volume_draws: Vec<VolumeDrawPlan>,
+    pub surface_draws: Vec<SurfaceDrawPlan>,
+    pub bundle_surface_plans: Vec<BundleSurfacePlan>,
+    pub bundle_draws: Vec<BundleDrawPlan>,
+    pub parcellation_draws: Vec<ParcellationDrawPlan>,
+    pub boundary_field_plans: Vec<BoundaryFieldPlan>,
+    pub boundary_glyph_draws: Vec<BoundaryGlyphDrawPlan>,
+}
+
+impl Default for SceneFramePlan {
+    fn default() -> Self {
+        Self {
+            reactive_streamline_plans: Vec::new(),
+            surface_query_plans: Vec::new(),
+            surface_map_plans: Vec::new(),
+            streamline_draws: Vec::new(),
+            volume_draws: Vec::new(),
+            surface_draws: Vec::new(),
+            bundle_surface_plans: Vec::new(),
+            bundle_draws: Vec::new(),
+            parcellation_draws: Vec::new(),
+            boundary_field_plans: Vec::new(),
+            boundary_glyph_draws: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct StreamlineFlow {
+    pub dataset: Arc<StreamlineDataset>,
+    pub selected_streamlines: Arc<Vec<u32>>,
+    pub color_mode: ColorMode,
+    pub scalar_auto_range: bool,
+    pub scalar_range_min: f32,
+    pub scalar_range_max: f32,
+}
+
+#[derive(Clone)]
+pub struct StreamlineDataset {
+    pub name: String,
+    pub gpu_data: Arc<TrxGpuData>,
+    pub backing: StreamlineBacking,
+}
+
+#[derive(Clone)]
+pub struct ParcellationAsset {
+    pub id: FileId,
+    pub name: String,
+    pub path: PathBuf,
+    pub data: Arc<ParcellationVolume>,
+    pub label_table_path: Option<PathBuf>,
+    pub visible: bool,
+}
+
+#[derive(Clone)]
+pub struct LoadedParcellation {
+    pub asset: ParcellationAsset,
+}
+
+#[derive(Clone)]
+pub struct StreamlineDrawPlan {
+    pub node_uuid: WorkflowNodeUuid,
+    pub draw_id: FileId,
+    pub label: String,
+    pub visible: bool,
+    pub flow: StreamlineFlow,
+    pub render_style: RenderStyle,
+    pub tube_radius_mm: f32,
+    pub tube_sides: u32,
+    pub slab_half_width_mm: f32,
+}
+
+#[derive(Clone)]
+pub struct BundleDrawPlan {
+    pub node_uuid: WorkflowNodeUuid,
+    pub build_node_uuid: WorkflowNodeUuid,
+    pub boundary_field_node_uuid: Option<WorkflowNodeUuid>,
+    pub draw_id: FileId,
+    pub label: String,
+    pub flow: StreamlineFlow,
+    pub per_group: bool,
+    pub color_mode: BundleSurfaceColorMode,
+    pub voxel_size_mm: f32,
+    pub threshold: f32,
+    pub smooth_sigma: f32,
+    pub opacity: f32,
+    pub outline_thickness: f32,
+}
+
+#[derive(Clone)]
+pub struct BoundaryGlyphDrawPlan {
+    pub node_uuid: WorkflowNodeUuid,
+    pub build_node_uuid: WorkflowNodeUuid,
+    pub label: String,
+    pub visible: bool,
+    pub scale: f32,
+    pub density_3d_step: usize,
+    pub slice_density_step: usize,
+    pub color_mode: BoundaryGlyphColorMode,
+    pub min_contacts: u32,
+}
+
+#[derive(Clone, Copy)]
+pub struct VolumeDrawPlan {
+    pub source_id: FileId,
+    pub colormap: VolumeColormap,
+    pub opacity: f32,
+    pub window_center: f32,
+    pub window_width: f32,
+}
+
+#[derive(Clone)]
+pub struct SurfaceDrawPlan {
+    pub node_uuid: WorkflowNodeUuid,
+    pub source_id: FileId,
+    pub gpu_index: usize,
+    pub color: [f32; 3],
+    pub opacity: f32,
+    pub outline_color: [f32; 3],
+    pub outline_thickness: f32,
+    pub show_projection_map: bool,
+    pub map_opacity: f32,
+    pub map_threshold: f32,
+    pub gloss: f32,
+    pub projection_colormap: SurfaceColormap,
+    pub range_min: f32,
+    pub range_max: f32,
+    pub projection_scalars: Option<Vec<f32>>,
+}
+
+pub const DEFAULT_SURFACE_COLOR: [f32; 3] = [0.72, 0.72, 0.72];
+pub const DEFAULT_SURFACE_OPACITY: f32 = 1.0;
+
+#[derive(Clone)]
+pub struct ParcellationDrawPlan {
+    pub source_id: FileId,
+    pub labels: BTreeSet<u32>,
+    pub opacity: f32,
+}
+
+#[derive(Clone)]
+pub struct SurfaceStreamlineMap {
+    pub surface_id: FileId,
+    pub scalars: Vec<f32>,
+    pub range_min: f32,
+    pub range_max: f32,
+}
+
+#[derive(Clone)]
+pub struct SurfaceQueryPlan {
+    pub node_uuid: WorkflowNodeUuid,
+    pub flow: StreamlineFlow,
+    pub surface_id: FileId,
+    pub surface: Arc<GiftiSurfaceData>,
+    pub depth_mm: f32,
+}
+
+#[derive(Clone)]
+pub struct SurfaceMapPlan {
+    pub node_uuid: WorkflowNodeUuid,
+    pub flow: StreamlineFlow,
+    pub surface_id: FileId,
+    pub surface: Arc<GiftiSurfaceData>,
+    pub depth_mm: f32,
+    pub dps_field: Option<String>,
+}
+
+#[derive(Clone, Copy)]
+pub enum ReactiveStreamlineOp {
+    Merge,
+}
+
+#[derive(Clone)]
+pub struct ReactiveStreamlinePlan {
+    pub node_uuid: WorkflowNodeUuid,
+    pub label: String,
+    pub op: ReactiveStreamlineOp,
+    pub left: StreamlineFlow,
+    pub right: StreamlineFlow,
+}
+
+#[derive(Clone)]
+pub struct BundleSurfacePlan {
+    pub build_node_uuid: WorkflowNodeUuid,
+    pub label: String,
+    pub flow: StreamlineFlow,
+    pub per_group: bool,
+    pub voxel_size_mm: f32,
+    pub threshold: f32,
+    pub smooth_sigma: f32,
+    pub opacity: f32,
+}
+
+#[derive(Clone)]
+pub struct BoundaryFieldPlan {
+    pub build_node_uuid: WorkflowNodeUuid,
+    pub label: String,
+    pub flow: StreamlineFlow,
+    pub voxel_size_mm: f32,
+    pub sphere_lod: u32,
+    pub normalization: BoundaryGlyphNormalization,
+}
+
+#[derive(Clone)]
+pub struct WorkflowRuntime {
+    pub scene_plan: SceneFramePlan,
+    pub node_state: HashMap<WorkflowNodeUuid, NodeEvalState>,
+    pub save_streamline_targets: HashMap<WorkflowNodeUuid, SaveStreamlinePlan>,
+    pub graph_error: Option<String>,
+}
+
+impl Default for WorkflowRuntime {
+    fn default() -> Self {
+        Self {
+            scene_plan: SceneFramePlan::default(),
+            node_state: HashMap::new(),
+            save_streamline_targets: HashMap::new(),
+            graph_error: None,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct SaveStreamlinePlan {
+    pub node_uuid: WorkflowNodeUuid,
+    pub output_path: PathBuf,
+    pub flow: StreamlineFlow,
+}
+
+#[derive(Clone)]
+pub(super) struct ParcelSelection {
+    pub source_id: FileId,
+    pub labels: BTreeSet<u32>,
+}
+
+#[derive(Clone)]
+pub(super) enum WorkflowValue {
+    Streamline(StreamlineFlow),
+    Volume(FileId),
+    Surface(FileId),
+    Parcellation(FileId),
+    ParcelSelection(ParcelSelection),
+    SurfaceStreamlineMap(SurfaceStreamlineMap),
+    BundleSurface(BundleSurfacePlan),
+    BoundaryField(BoundaryFieldPlan),
+}
+
+#[derive(Clone)]
+pub(super) struct EvaluatedValue {
+    pub value: WorkflowValue,
+    pub stale: bool,
+}
+
+impl From<WorkflowValue> for EvaluatedValue {
+    fn from(value: WorkflowValue) -> Self {
+        Self {
+            value,
+            stale: false,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorkflowSelection {
+    Node(WorkflowNodeUuid),
+    Asset(FileId),
+}
+
+#[derive(Clone)]
+pub struct StreamlineDisplayRuntime {
+    pub draw_id: FileId,
+    pub fingerprint: u64,
+    pub bundle_fingerprint: Option<u64>,
+    pub bundle_meshes_cpu: Vec<BundleMesh>,
+}
+
+impl Default for StreamlineDisplayRuntime {
+    fn default() -> Self {
+        Self {
+            draw_id: 0,
+            fingerprint: 0,
+            bundle_fingerprint: None,
+            bundle_meshes_cpu: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum WorkflowJobKind {
+    ReactiveStreamline,
+    SurfaceQuery,
+    SurfaceMap,
+    TubeGeometry,
+    BundleSurface,
+    BoundaryField,
+}
+
+#[derive(Clone)]
+pub enum WorkflowJobPayload {
+    ReactiveStreamline(ReactiveStreamlinePlan),
+    SurfaceQuery(SurfaceQueryPlan),
+    SurfaceMap(SurfaceMapPlan),
+    TubeGeometry(StreamlineDrawPlan),
+    BundleSurface {
+        plan: BundleSurfacePlan,
+        color_mode: BundleSurfaceColorMode,
+        boundary_field: Option<Arc<BoundaryContactField>>,
+    },
+    BoundaryField {
+        plan: BoundaryFieldPlan,
+    },
+}
+
+#[derive(Clone)]
+pub enum WorkflowJobOutput {
+    ReactiveStreamline(StreamlineFlow),
+    SurfaceQuery(StreamlineFlow),
+    SurfaceMap(SurfaceStreamlineMap),
+    TubeGeometry {
+        vertices: Vec<crate::data::trx_data::TubeMeshVertex>,
+        indices: Vec<u32>,
+    },
+    BundleSurface {
+        meshes: Vec<(BundleMesh, String)>,
+    },
+    BoundaryField {
+        field: Option<Arc<BoundaryContactField>>,
+    },
+}
+
+#[derive(Clone)]
+pub enum WorkflowJobMessage {
+    Started {
+        node_uuid: WorkflowNodeUuid,
+        fingerprint: u64,
+        kind: WorkflowJobKind,
+    },
+    Finished {
+        node_uuid: WorkflowNodeUuid,
+        fingerprint: u64,
+        kind: WorkflowJobKind,
+        result: Result<WorkflowJobOutput, String>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum PortKind {
+    Streamline,
+    Volume,
+    Surface,
+    Parcellation,
+    ParcelSelection,
+    SurfaceMap,
+    BundleSurface,
+    BoundaryField,
+}
+
+pub struct SeededWorkflowBranch {
+    pub bounds: Rect,
+    pub primary_selection: WorkflowSelection,
+}
+
+pub fn default_workspace_tree() -> Tree<WorkspacePane> {
+    let mut tiles = Tiles::default();
+    let assets = tiles.insert_pane(WorkspacePane::Assets);
+    let graph = tiles.insert_pane(WorkspacePane::Graph);
+    let inspector = tiles.insert_pane(WorkspacePane::Inspector);
+    let mut sidebar = Linear::new(LinearDir::Vertical, vec![inspector, assets]);
+    sidebar.shares[inspector] = 1.2;
+    sidebar.shares[assets] = 0.9;
+    let sidebar = tiles.insert_new(Tile::Container(Container::Linear(sidebar)));
+
+    let mut root = Linear::new(LinearDir::Horizontal, vec![sidebar, graph]);
+    root.shares[sidebar] = 0.9;
+    root.shares[graph] = 2.9;
+    let root = tiles.insert_new(Tile::Container(Container::Linear(root)));
+    Tree::new("workflow_workspace", root, tiles)
+}
+
+pub fn default_document() -> WorkflowDocument {
+    WorkflowDocument {
+        next_node_uuid: 1,
+        graph: Snarl::new(),
+        workspace: default_workspace_tree(),
+        assets: Vec::new(),
+    }
+}
+
+impl Default for WorkflowProject {
+    fn default() -> Self {
+        Self {
+            version: 1,
+            document: default_document(),
+        }
+    }
+}
+
+impl WorkflowNodeKind {
+    pub fn is_expensive(&self) -> bool {
+        match self {
+            Self::SurfaceDepthQuery { .. }
+            | Self::SurfaceProjectionDensity { .. }
+            | Self::SurfaceProjectionMeanDps { .. }
+            | Self::BundleSurfaceBuild { .. }
+            | Self::BoundaryFieldBuild { .. } => true,
+            Self::StreamlineDisplay { render_style, .. } => *render_style == RenderStyle::Tubes,
+            _ => false,
+        }
+    }
+
+    pub fn title(&self) -> &'static str {
+        match self {
+            Self::StreamlineSource { .. } => "Streamline Source",
+            Self::VolumeSource { .. } => "Volume Source",
+            Self::SurfaceSource { .. } => "Surface Source",
+            Self::ParcellationSource { .. } => "Parcellation Source",
+            Self::LimitStreamlines { .. } => "Limit Streamlines",
+            Self::GroupSelect { .. } => "Group Select",
+            Self::RandomSubset { .. } => "Random Subset",
+            Self::SphereQuery { .. } => "Sphere Query",
+            Self::SurfaceDepthQuery { .. } => "Surface Depth Query",
+            Self::RemoveDuplicates => "Remove Duplicates",
+            Self::Merge => "Merge",
+            Self::AddGroupsFromParcellation => "Add Groups From Parcellation",
+            Self::ParcelSelect { .. } => "Parcel Select",
+            Self::ParcelROI => "Parcel ROI",
+            Self::ParcelROA => "Parcel ROA",
+            Self::ParcelEnd { .. } => "Parcel End",
+            Self::ParcelLimiting => "Parcel Limiting",
+            Self::ParcelTerminative => "Parcel Terminative",
+            Self::ParcelSurfaceBuild => "Parcel Surface Build",
+            Self::ColorByDirection => "Color By Direction",
+            Self::ColorByGroup => "Color By Group",
+            Self::ColorByDPV { .. } => "Color By DPV",
+            Self::ColorByDPS { .. } => "Color By DPS",
+            Self::UniformColor { .. } => "Uniform Color",
+            Self::SurfaceProjectionDensity { .. } => "Map Streamlines to Surface",
+            Self::SurfaceProjectionMeanDps { .. } => "Map Streamlines to Surface (Mean DPS)",
+            Self::BundleSurfaceBuild { .. } => "Bundle Surface Build",
+            Self::BoundaryFieldBuild { .. } => "Boundary Field Build",
+            Self::StreamlineDisplay { .. } => "Streamline Display",
+            Self::VolumeDisplay { .. } => "Volume Display",
+            Self::SurfaceDisplay { .. } => "Surface Display",
+            Self::BundleSurfaceDisplay { .. } => "Bundle Surface Display",
+            Self::BoundaryGlyphDisplay { .. } => "Boundary Glyph Display",
+            Self::ParcellationDisplay { .. } => "Parcellation Display",
+            Self::SaveStreamlines { .. } => "Save Streamlines",
+        }
+    }
+
+    pub(super) fn inputs(&self) -> Vec<PortKind> {
+        match self {
+            Self::StreamlineSource { .. }
+            | Self::VolumeSource { .. }
+            | Self::SurfaceSource { .. }
+            | Self::ParcellationSource { .. } => Vec::new(),
+            Self::LimitStreamlines { .. }
+            | Self::GroupSelect { .. }
+            | Self::RandomSubset { .. }
+            | Self::SphereQuery { .. }
+            | Self::RemoveDuplicates
+            | Self::ColorByDirection
+            | Self::ColorByGroup
+            | Self::ColorByDPV { .. }
+            | Self::ColorByDPS { .. }
+            | Self::UniformColor { .. }
+            | Self::StreamlineDisplay { .. }
+            | Self::SaveStreamlines { .. } => vec![PortKind::Streamline],
+            Self::BundleSurfaceBuild { .. } => vec![PortKind::Streamline],
+            Self::BoundaryFieldBuild { .. } => vec![PortKind::Streamline],
+            Self::BundleSurfaceDisplay { .. } => {
+                vec![PortKind::BundleSurface, PortKind::BoundaryField]
+            }
+            Self::BoundaryGlyphDisplay { .. } => vec![PortKind::BoundaryField],
+            Self::SurfaceDepthQuery { .. } => vec![PortKind::Streamline, PortKind::Surface],
+            Self::Merge => {
+                vec![PortKind::Streamline, PortKind::Streamline]
+            }
+            Self::AddGroupsFromParcellation => vec![PortKind::Streamline, PortKind::Parcellation],
+            Self::ParcelSelect { .. } | Self::ParcellationDisplay { .. } => {
+                vec![PortKind::Parcellation]
+            }
+            Self::ParcelROI
+            | Self::ParcelROA
+            | Self::ParcelEnd { .. }
+            | Self::ParcelLimiting
+            | Self::ParcelTerminative => {
+                vec![PortKind::Streamline, PortKind::ParcelSelection]
+            }
+            Self::ParcelSurfaceBuild => vec![PortKind::ParcelSelection],
+            Self::SurfaceProjectionDensity { .. } | Self::SurfaceProjectionMeanDps { .. } => {
+                vec![PortKind::Streamline, PortKind::Surface]
+            }
+            Self::VolumeDisplay { .. } => vec![PortKind::Volume],
+            Self::SurfaceDisplay { .. } => vec![PortKind::Surface, PortKind::SurfaceMap],
+        }
+    }
+
+    pub(super) fn outputs(&self) -> Vec<PortKind> {
+        match self {
+            Self::StreamlineSource { .. }
+            | Self::LimitStreamlines { .. }
+            | Self::GroupSelect { .. }
+            | Self::RandomSubset { .. }
+            | Self::SphereQuery { .. }
+            | Self::SurfaceDepthQuery { .. }
+            | Self::RemoveDuplicates
+            | Self::Merge
+            | Self::AddGroupsFromParcellation
+            | Self::ParcelROI
+            | Self::ParcelROA
+            | Self::ParcelEnd { .. }
+            | Self::ParcelLimiting
+            | Self::ParcelTerminative
+            | Self::ColorByDirection
+            | Self::ColorByGroup
+            | Self::ColorByDPV { .. }
+            | Self::ColorByDPS { .. }
+            | Self::UniformColor { .. } => vec![PortKind::Streamline],
+            Self::VolumeSource { .. } => vec![PortKind::Volume],
+            Self::SurfaceSource { .. } => vec![PortKind::Surface],
+            Self::ParcellationSource { .. } => vec![PortKind::Parcellation],
+            Self::ParcelSelect { .. } => vec![PortKind::ParcelSelection],
+            Self::SurfaceProjectionDensity { .. } | Self::SurfaceProjectionMeanDps { .. } => {
+                vec![PortKind::SurfaceMap]
+            }
+            Self::BundleSurfaceBuild { .. } => vec![PortKind::BundleSurface],
+            Self::BoundaryFieldBuild { .. } => vec![PortKind::BoundaryField],
+            Self::ParcelSurfaceBuild
+            | Self::StreamlineDisplay { .. }
+            | Self::VolumeDisplay { .. }
+            | Self::SurfaceDisplay { .. }
+            | Self::BoundaryGlyphDisplay { .. }
+            | Self::ParcellationDisplay { .. }
+            | Self::BundleSurfaceDisplay { .. }
+            | Self::SaveStreamlines { .. } => Vec::new(),
+        }
+    }
+}

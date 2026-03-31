@@ -35,6 +35,7 @@ struct MeshVertex {
     normal: [f32; 3],
 }
 
+#[derive(Clone)]
 pub struct MeshDrawStyle {
     pub color: [f32; 4],
     pub scalar_min: f32,
