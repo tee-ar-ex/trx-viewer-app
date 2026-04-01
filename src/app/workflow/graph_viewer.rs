@@ -338,6 +338,7 @@ impl SnarlViewer<WorkflowNode> for WorkflowGraphViewer<'_> {
                     voxel_size_mm: 2.0,
                     threshold: 3.0,
                     smooth_sigma: 0.5,
+                    min_component_volume_mm3: 0.0,
                     opacity: 0.5,
                 },
             );

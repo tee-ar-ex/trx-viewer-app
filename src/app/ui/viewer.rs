@@ -107,8 +107,7 @@ impl super::super::TrxViewerApp {
             .show(ctx, |ui| {
                 ui.label(self.viewport.export_dialog.target.label());
                 ui.add(
-                    egui::Slider::new(&mut self.viewport.export_dialog.scale, 1..=8)
-                        .text("Scale"),
+                    egui::Slider::new(&mut self.viewport.export_dialog.scale, 1..=8).text("Scale"),
                 );
                 ui.small("Scale multiplies the current viewer window resolution.");
                 ui.horizontal(|ui| {
@@ -167,10 +166,14 @@ impl super::super::TrxViewerApp {
             .with_resizable(false)
             .with_taskbar(false);
         let target = pending.target;
-        ctx.show_viewport_immediate(export_viewport_id(target), builder, |ctx, _class| match target {
-            ExportTarget::View3D => self.show_3d_contents(ctx, false),
-            ExportTarget::View2D => self.show_2d_contents(ctx, false),
-        });
+        ctx.show_viewport_immediate(
+            export_viewport_id(target),
+            builder,
+            |ctx, _class| match target {
+                ExportTarget::View3D => self.show_3d_contents(ctx, false),
+                ExportTarget::View2D => self.show_2d_contents(ctx, false),
+            },
+        );
     }
 
     fn show_3d_contents(&mut self, ctx: &egui::Context, interactive: bool) {
@@ -180,21 +183,20 @@ impl super::super::TrxViewerApp {
         }
 
         let render_data = self.build_viewer_render_data();
-        egui::TopBottomPanel::top("window_3d_toolbar")
-            .show_animated(ctx, interactive, |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    ui.small("3D window");
-                    ui.separator();
-                    ui.label("Slice quads");
-                    ui.checkbox(&mut self.viewport.slice_visible[0], "Axial");
-                    ui.checkbox(&mut self.viewport.slice_visible[1], "Coronal");
-                    ui.checkbox(&mut self.viewport.slice_visible[2], "Sagittal");
-                    ui.separator();
-                    ui.small("Drag orbit");
-                    ui.small("Shift-drag or middle-drag pan");
-                    ui.small("Scroll zoom");
-                });
+        egui::TopBottomPanel::top("window_3d_toolbar").show_animated(ctx, interactive, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.small("3D window");
+                ui.separator();
+                ui.label("Slice quads");
+                ui.checkbox(&mut self.viewport.slice_visible[0], "Axial");
+                ui.checkbox(&mut self.viewport.slice_visible[1], "Coronal");
+                ui.checkbox(&mut self.viewport.slice_visible[2], "Sagittal");
+                ui.separator();
+                ui.small("Drag orbit");
+                ui.small("Shift-drag or middle-drag pan");
+                ui.small("Scroll zoom");
             });
+        });
 
         egui::CentralPanel::default().show(ctx, |ui| {
             if self.scene_is_empty() {
@@ -204,7 +206,8 @@ impl super::super::TrxViewerApp {
                 return;
             }
 
-            let (rect, response) = ui.allocate_exact_size(ui.available_size(), egui::Sense::click_and_drag());
+            let (rect, response) =
+                ui.allocate_exact_size(ui.available_size(), egui::Sense::click_and_drag());
             self.draw_scene3d_rect(ui, rect, interactive.then_some(&response), &render_data);
         });
 
@@ -218,53 +221,56 @@ impl super::super::TrxViewerApp {
         }
 
         let render_data = self.build_viewer_render_data();
-        egui::TopBottomPanel::top("window_2d_toolbar")
-            .show_animated(ctx, interactive, |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    ui.label("Mode");
-                    egui::ComboBox::from_id_salt("mode_2d")
-                        .selected_text(self.viewport.view_2d.mode.label())
-                        .show_ui(ui, |ui| {
-                            for mode in View2DMode::ALL {
-                                ui.selectable_value(&mut self.viewport.view_2d.mode, mode, mode.label());
-                            }
-                        });
+        egui::TopBottomPanel::top("window_2d_toolbar").show_animated(ctx, interactive, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Mode");
+                egui::ComboBox::from_id_salt("mode_2d")
+                    .selected_text(self.viewport.view_2d.mode.label())
+                    .show_ui(ui, |ui| {
+                        for mode in View2DMode::ALL {
+                            ui.selectable_value(
+                                &mut self.viewport.view_2d.mode,
+                                mode,
+                                mode.label(),
+                            );
+                        }
+                    });
 
-                    match self.viewport.view_2d.mode {
-                        View2DMode::Slice => {
-                            ui.separator();
-                            slice_kind_picker(ui, &mut self.viewport.view_2d.single_view, "slice_axis");
-                        }
-                        View2DMode::Ortho => {
-                            ui.separator();
-                            ui.checkbox(&mut self.viewport.view_2d.ortho_show_row, "Row layout");
-                        }
-                        View2DMode::Lightbox => {
-                            ui.separator();
-                            slice_kind_picker(
-                                ui,
-                                &mut self.viewport.view_2d.lightbox_axis,
-                                "lightbox_axis",
-                            );
-                            ui.add(
-                                egui::DragValue::new(&mut self.viewport.view_2d.lightbox_rows)
-                                    .range(1..=8)
-                                    .prefix("Rows "),
-                            );
-                            ui.add(
-                                egui::DragValue::new(&mut self.viewport.view_2d.lightbox_cols)
-                                    .range(1..=8)
-                                    .prefix("Cols "),
-                            );
-                        }
+                match self.viewport.view_2d.mode {
+                    View2DMode::Slice => {
+                        ui.separator();
+                        slice_kind_picker(ui, &mut self.viewport.view_2d.single_view, "slice_axis");
                     }
+                    View2DMode::Ortho => {
+                        ui.separator();
+                        ui.checkbox(&mut self.viewport.view_2d.ortho_show_row, "Row layout");
+                    }
+                    View2DMode::Lightbox => {
+                        ui.separator();
+                        slice_kind_picker(
+                            ui,
+                            &mut self.viewport.view_2d.lightbox_axis,
+                            "lightbox_axis",
+                        );
+                        ui.add(
+                            egui::DragValue::new(&mut self.viewport.view_2d.lightbox_rows)
+                                .range(1..=8)
+                                .prefix("Rows "),
+                        );
+                        ui.add(
+                            egui::DragValue::new(&mut self.viewport.view_2d.lightbox_cols)
+                                .range(1..=8)
+                                .prefix("Cols "),
+                        );
+                    }
+                }
 
-                    ui.separator();
-                    ui.small("Pan: drag");
-                    ui.small("Move slice: scroll");
-                    ui.small("Zoom: pinch");
-                });
+                ui.separator();
+                ui.small("Pan: drag");
+                ui.small("Move slice: scroll");
+                ui.small("Zoom: pinch");
             });
+        });
 
         egui::CentralPanel::default().show(ctx, |ui| {
             if self.scene_is_empty() {
@@ -296,7 +302,8 @@ impl super::super::TrxViewerApp {
             .single_view
             .slice_axis_index()
             .unwrap_or(0);
-        let (rect, response) = ui.allocate_exact_size(ui.available_size(), egui::Sense::click_and_drag());
+        let (rect, response) =
+            ui.allocate_exact_size(ui.available_size(), egui::Sense::click_and_drag());
         self.draw_slice_rect(
             ui,
             rect,
@@ -322,8 +329,10 @@ impl super::super::TrxViewerApp {
             let height = available.y.max(80.0);
             ui.horizontal(|ui| {
                 for axis_index in 0..3 {
-                    let (rect, response) =
-                        ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::click_and_drag());
+                    let (rect, response) = ui.allocate_exact_size(
+                        egui::vec2(width, height),
+                        egui::Sense::click_and_drag(),
+                    );
                     self.draw_slice_rect(
                         ui,
                         rect,
@@ -340,37 +349,44 @@ impl super::super::TrxViewerApp {
             let width = ((available.x - spacing.x) / 2.0).max(80.0);
             let height = ((available.y - spacing.y) / 2.0).max(80.0);
             ui.horizontal(|ui| {
-                let (rect0, response0) =
-                    ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::click_and_drag());
+                let (rect0, response0) = ui
+                    .allocate_exact_size(egui::vec2(width, height), egui::Sense::click_and_drag());
                 self.draw_slice_rect(
                     ui,
                     rect0,
                     interactive.then_some(&response0),
                     0,
-                    self.viewport.slice_world_position(&self.scene.nifti_files, 0),
+                    self.viewport
+                        .slice_world_position(&self.scene.nifti_files, 0),
                     render_data,
                     true,
                 );
                 ui.vertical(|ui| {
-                    let (rect1, response1) =
-                        ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::click_and_drag());
+                    let (rect1, response1) = ui.allocate_exact_size(
+                        egui::vec2(width, height),
+                        egui::Sense::click_and_drag(),
+                    );
                     self.draw_slice_rect(
                         ui,
                         rect1,
                         interactive.then_some(&response1),
                         1,
-                        self.viewport.slice_world_position(&self.scene.nifti_files, 1),
+                        self.viewport
+                            .slice_world_position(&self.scene.nifti_files, 1),
                         render_data,
                         true,
                     );
-                    let (rect2, response2) =
-                        ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::click_and_drag());
+                    let (rect2, response2) = ui.allocate_exact_size(
+                        egui::vec2(width, height),
+                        egui::Sense::click_and_drag(),
+                    );
                     self.draw_slice_rect(
                         ui,
                         rect2,
                         interactive.then_some(&response2),
                         2,
-                        self.viewport.slice_world_position(&self.scene.nifti_files, 2),
+                        self.viewport
+                            .slice_world_position(&self.scene.nifti_files, 2),
                         render_data,
                         true,
                     );
@@ -397,10 +413,10 @@ impl super::super::TrxViewerApp {
         let center_tile = total / 2;
         let available = ui.available_size();
         let spacing = ui.spacing().item_spacing;
-        let tile_width = ((available.x - spacing.x * (cols.saturating_sub(1) as f32)) / cols as f32)
-            .max(60.0);
-        let tile_height = ((available.y - spacing.y * (rows.saturating_sub(1) as f32)) / rows as f32)
-            .max(60.0);
+        let tile_width =
+            ((available.x - spacing.x * (cols.saturating_sub(1) as f32)) / cols as f32).max(60.0);
+        let tile_height =
+            ((available.y - spacing.y * (rows.saturating_sub(1) as f32)) / rows as f32).max(60.0);
         let center_index = self.viewport.slice_indices[axis_index];
         let max_index = self.max_slice_index(axis_index);
 
@@ -410,9 +426,11 @@ impl super::super::TrxViewerApp {
                     let tile = row * cols + col;
                     let delta = tile as isize - center_tile as isize;
                     let index = center_index.saturating_add_signed(delta).min(max_index);
-                    let slice_pos = self
-                        .viewport
-                        .slice_world_position_for_index(&self.scene.nifti_files, axis_index, index);
+                    let slice_pos = self.viewport.slice_world_position_for_index(
+                        &self.scene.nifti_files,
+                        axis_index,
+                        index,
+                    );
                     let (rect, response) = ui.allocate_exact_size(
                         egui::vec2(tile_width, tile_height),
                         egui::Sense::click_and_drag(),
@@ -653,7 +671,9 @@ impl super::super::TrxViewerApp {
             glyph_color_mode: glyph_draw
                 .map(|draw| draw.color_mode)
                 .unwrap_or(crate::data::orientation_field::BoundaryGlyphColorMode::DirectionRgb),
-            glyph_density_3d_step: glyph_draw.map(|draw| draw.density_3d_step as u32).unwrap_or(1),
+            glyph_density_3d_step: glyph_draw
+                .map(|draw| draw.density_3d_step as u32)
+                .unwrap_or(1),
             glyph_slice_density_step: glyph_draw
                 .map(|draw| draw.slice_density_step as u32)
                 .unwrap_or(1),

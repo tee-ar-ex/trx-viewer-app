@@ -150,7 +150,12 @@ impl super::super::TrxViewerApp {
     }
 
     fn show_asset_inspector(&mut self, ui: &mut egui::Ui, asset_id: usize) {
-        if let Some(trx) = self.scene.trx_files.iter().find(|asset| asset.id == asset_id) {
+        if let Some(trx) = self
+            .scene
+            .trx_files
+            .iter()
+            .find(|asset| asset.id == asset_id)
+        {
             ui.strong(&trx.name);
             ui.label(trx.path.display().to_string());
             ui.separator();
@@ -162,7 +167,12 @@ impl super::super::TrxViewerApp {
             ));
             return;
         }
-        if let Some(volume) = self.scene.nifti_files.iter().find(|asset| asset.id == asset_id) {
+        if let Some(volume) = self
+            .scene
+            .nifti_files
+            .iter()
+            .find(|asset| asset.id == asset_id)
+        {
             ui.strong(&volume.name);
             ui.label(format!(
                 "Dims: {} x {} x {}",
@@ -171,7 +181,8 @@ impl super::super::TrxViewerApp {
             return;
         }
         if let Some(surface) = self
-            .scene.gifti_surfaces
+            .scene
+            .gifti_surfaces
             .iter_mut()
             .find(|asset| asset.id == asset_id)
         {
@@ -186,7 +197,8 @@ impl super::super::TrxViewerApp {
             return;
         }
         if let Some(parcel) = self
-            .scene.parcellations
+            .scene
+            .parcellations
             .iter()
             .find(|asset| asset.asset.id == asset_id)
         {
@@ -214,7 +226,8 @@ impl super::super::TrxViewerApp {
 
     fn show_node_inspector(&mut self, ui: &mut egui::Ui, node_uuid: workflow::WorkflowNodeUuid) {
         let Some((node_id, _)) = self
-            .workflow.document
+            .workflow
+            .document
             .graph
             .node_ids()
             .find(|(_, node)| node.uuid == node_uuid)
@@ -399,6 +412,7 @@ impl super::super::TrxViewerApp {
                 voxel_size_mm,
                 threshold,
                 smooth_sigma,
+                min_component_volume_mm3,
                 opacity,
             } => {
                 ui.checkbox(per_group, "Per group");
@@ -416,6 +430,12 @@ impl super::super::TrxViewerApp {
                     egui::DragValue::new(smooth_sigma)
                         .speed(0.05)
                         .prefix("Smooth "),
+                );
+                ui.add(
+                    egui::DragValue::new(min_component_volume_mm3)
+                        .speed(1.0)
+                        .range(0.0..=1_000_000.0)
+                        .prefix("Min component mm^3 "),
                 );
                 ui.add(egui::Slider::new(opacity, 0.0..=1.0).text("Opacity"));
             }
@@ -535,7 +555,8 @@ impl super::super::TrxViewerApp {
                     }
                 });
                 let ready = self
-                    .workflow.runtime
+                    .workflow
+                    .runtime
                     .save_streamline_targets
                     .contains_key(&node_uuid);
                 if ui

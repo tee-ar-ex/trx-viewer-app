@@ -11,8 +11,8 @@ use crate::renderer::slice_renderer::{AllSliceResources, SliceAxis};
 
 pub(crate) use state::SceneLightingParams as AppSceneLightingParams;
 use state::{
-    ImportDialogState, PendingFileLoad, SceneState, ViewportState, WorkerMessage, WorkerReceiver,
-    WorkerSender, WorkflowState,
+    ImportDialogState, MergeStreamlinesDialogState, PendingFileLoad, SceneState, ViewportState,
+    WorkerMessage, WorkerReceiver, WorkerSender, WorkflowState,
 };
 use workflow::workflow_job_kind_title;
 
@@ -28,6 +28,7 @@ pub struct TrxViewerApp {
     pub(crate) next_job_id: u64,
     pub(crate) pending_file_loads: Vec<PendingFileLoad>,
     pub(crate) import_dialog: ImportDialogState,
+    pub(crate) merge_streamlines_dialog: MergeStreamlinesDialogState,
 }
 
 impl TrxViewerApp {
@@ -108,6 +109,29 @@ impl TrxViewerApp {
                         }
                         Err(err) => {
                             self.error_msg = Some(format!("Failed to import streamlines: {err}"))
+                        }
+                    }
+                }
+                WorkerMessage::MergedStreamlinesCreated {
+                    job_id,
+                    path,
+                    result,
+                } => {
+                    self.pending_file_loads.retain(|job| job.job_id != job_id);
+                    match result {
+                        Ok(data) => {
+                            if let Some(rs) = frame.wgpu_render_state() {
+                                self.apply_loaded_trx(path.clone(), data, rs);
+                                self.status_msg = Some(format!(
+                                    "Created merged streamlines at {}",
+                                    path.display()
+                                ));
+                                self.error_msg = None;
+                            }
+                        }
+                        Err(err) => {
+                            self.error_msg =
+                                Some(format!("Failed to create merged streamlines: {err}"))
                         }
                     }
                 }
@@ -196,6 +220,7 @@ impl TrxViewerApp {
             next_job_id: 1,
             pending_file_loads: Vec::new(),
             import_dialog: ImportDialogState::default(),
+            merge_streamlines_dialog: MergeStreamlinesDialogState::default(),
         };
 
         if cc.wgpu_render_state.is_some() {
@@ -305,6 +330,9 @@ impl eframe::App for TrxViewerApp {
         if menu_action.import_streamlines {
             self.open_import_dialog(None);
         }
+        if menu_action.create_streamline_merge {
+            self.merge_streamlines_dialog.open();
+        }
         if menu_action.open_nifti {
             if let Some(path) = rfd::FileDialog::new()
                 .add_filter("NIfTI files", &["nii", "nii.gz", "gz"])
@@ -358,6 +386,30 @@ impl eframe::App for TrxViewerApp {
             } else {
                 self.import_dialog.error_msg =
                     Some("Choose a supported foreign streamline file to import.".to_string());
+            }
+        }
+        let merge_action = ui::merge_streamlines_dialog::show_merge_streamlines_dialog(
+            ctx,
+            &mut self.merge_streamlines_dialog,
+        );
+        if merge_action.merge_requested {
+            if self.merge_streamlines_dialog.output_path.is_none() {
+                self.merge_streamlines_dialog.error_msg =
+                    Some("Choose an output TRX path.".to_string());
+            } else if self
+                .merge_streamlines_dialog
+                .rows
+                .iter()
+                .filter(|row| row.source_path.is_some() && row.detected_format.is_some())
+                .count()
+                < 2
+            {
+                self.merge_streamlines_dialog.error_msg =
+                    Some("Choose at least two supported streamline inputs.".to_string());
+            } else {
+                let merge_state = self.merge_streamlines_dialog.clone();
+                self.begin_merge_streamlines(&merge_state);
+                self.merge_streamlines_dialog.close();
             }
         }
 

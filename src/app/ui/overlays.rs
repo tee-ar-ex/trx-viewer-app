@@ -3,7 +3,6 @@ use glam::Vec3;
 use crate::app::helpers::{intersect_edge_with_slice, tri_axis_value};
 
 impl crate::app::TrxViewerApp {
-
     /// Draw anatomical orientation labels (R/L/A/P/S/I) on a slice view.
     pub(super) fn draw_orientation_labels(
         &self,
@@ -130,18 +129,24 @@ impl crate::app::TrxViewerApp {
         let (other_a, other_b) = match axis_index {
             // Axial view: show coronal (Y) and sagittal (X) positions
             0 => (
-                self.viewport.slice_world_position(&self.scene.nifti_files, 2),
-                self.viewport.slice_world_position(&self.scene.nifti_files, 1),
+                self.viewport
+                    .slice_world_position(&self.scene.nifti_files, 2),
+                self.viewport
+                    .slice_world_position(&self.scene.nifti_files, 1),
             ),
             // Coronal view: show sagittal (X) and axial (Z) positions
             1 => (
-                self.viewport.slice_world_position(&self.scene.nifti_files, 2),
-                self.viewport.slice_world_position(&self.scene.nifti_files, 0),
+                self.viewport
+                    .slice_world_position(&self.scene.nifti_files, 2),
+                self.viewport
+                    .slice_world_position(&self.scene.nifti_files, 0),
             ),
             // Sagittal view: show coronal (Y) and axial (Z) positions
             _ => (
-                self.viewport.slice_world_position(&self.scene.nifti_files, 1),
-                self.viewport.slice_world_position(&self.scene.nifti_files, 0),
+                self.viewport
+                    .slice_world_position(&self.scene.nifti_files, 1),
+                self.viewport
+                    .slice_world_position(&self.scene.nifti_files, 0),
             ),
         };
 
@@ -395,13 +400,16 @@ impl crate::app::TrxViewerApp {
                     }
 
                     let rgb = [
-                        (mesh.vertices[ia].color[0] + mesh.vertices[ib].color[0]
+                        (mesh.vertices[ia].color[0]
+                            + mesh.vertices[ib].color[0]
                             + mesh.vertices[ic].color[0])
                             / 3.0,
-                        (mesh.vertices[ia].color[1] + mesh.vertices[ib].color[1]
+                        (mesh.vertices[ia].color[1]
+                            + mesh.vertices[ib].color[1]
                             + mesh.vertices[ic].color[1])
                             / 3.0,
-                        (mesh.vertices[ia].color[2] + mesh.vertices[ib].color[2]
+                        (mesh.vertices[ia].color[2]
+                            + mesh.vertices[ib].color[2]
                             + mesh.vertices[ic].color[2])
                             / 3.0,
                     ];
@@ -411,8 +419,7 @@ impl crate::app::TrxViewerApp {
                         (rgb[2].clamp(0.0, 1.0) * 255.0) as u8,
                         (draw.opacity.clamp(0.0, 1.0) * 255.0) as u8,
                     );
-                    let stroke =
-                        egui::Stroke::new(draw.outline_thickness.clamp(0.25, 8.0), color);
+                    let stroke = egui::Stroke::new(draw.outline_thickness.clamp(0.25, 8.0), color);
 
                     let mut pts = Vec::with_capacity(3);
                     for (p0, p1) in [(a, b), (b, c), (c, a)] {
@@ -463,7 +470,8 @@ impl crate::app::TrxViewerApp {
         slice_pos: f32,
     ) {
         if self
-            .workflow.runtime
+            .workflow
+            .runtime
             .scene_plan
             .parcellation_draws
             .is_empty()
@@ -484,7 +492,8 @@ impl crate::app::TrxViewerApp {
 
         for draw in &self.workflow.runtime.scene_plan.parcellation_draws {
             let Some(parcellation) = self
-                .scene.parcellations
+                .scene
+                .parcellations
                 .iter()
                 .find(|asset| asset.asset.id == draw.source_id)
             else {

@@ -2,7 +2,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use glam::Vec3;
-use trx_rs::ConversionOptions;
+use trx_rs::{
+    AnyTrxFile, ConcatenateOptions, ConversionOptions, DType, Format, concatenate_any_trx,
+    header_from_reference,
+};
 
 use crate::data::gifti_data::GiftiSurfaceData;
 use crate::data::loaded_files::{
@@ -18,11 +21,22 @@ use crate::renderer::slice_renderer::{AllSliceResources, SliceAxis, SliceResourc
 
 use super::state::{
     ImportDialogState, LoadedGiftiSurface, LoadedParcellationSource, LoadedStreamlineSource,
-    WorkerMessage,
+    MergeStreamlinesDialogState, WorkerMessage,
 };
 use super::workflow::{self, LoadedParcellation, ParcellationAsset, WorkflowAssetDocument};
 
 impl super::TrxViewerApp {
+    fn loaded_streamline_source_from_any(
+        any: AnyTrxFile,
+    ) -> Result<LoadedStreamlineSource, String> {
+        TrxGpuData::from_any_trx(&any)
+            .map(|data| LoadedStreamlineSource {
+                data,
+                backing: StreamlineBacking::Native(Arc::new(any)),
+            })
+            .map_err(|e| e.to_string())
+    }
+
     fn allocate_file_id(&mut self, explicit_id: Option<FileId>) -> FileId {
         if let Some(id) = explicit_id {
             self.scene.next_file_id = self.scene.next_file_id.max(id + 1);
@@ -65,16 +79,9 @@ impl super::TrxViewerApp {
         self.pending_file_loads
             .push(super::state::PendingFileLoad { job_id, label });
         std::thread::spawn(move || {
-            let result = trx_rs::AnyTrxFile::load(&path)
+            let result = AnyTrxFile::load(&path)
                 .map_err(|e| e.to_string())
-                .and_then(|any| {
-                    TrxGpuData::from_any_trx(&any)
-                        .map(|data| LoadedStreamlineSource {
-                            data,
-                            backing: StreamlineBacking::Native(Arc::new(any)),
-                        })
-                        .map_err(|e| e.to_string())
-                });
+                .and_then(Self::loaded_streamline_source_from_any);
             let _ = tx.send(WorkerMessage::TrxLoaded {
                 job_id,
                 path,
@@ -180,6 +187,44 @@ impl super::TrxViewerApp {
         });
     }
 
+    pub(super) fn begin_merge_streamlines(&mut self, state: &MergeStreamlinesDialogState) {
+        let Some(output_path) = state.output_path.clone() else {
+            return;
+        };
+        let job_id = self.next_job_id;
+        self.next_job_id += 1;
+        let tx = self.worker_tx.clone();
+        let rows = state.rows.clone();
+        let options = ConcatenateOptions {
+            delete_dps: state.delete_dps,
+            delete_dpv: state.delete_dpv,
+            delete_groups: state.delete_groups,
+            positions_dtype: state.positions_dtype.map(DType::from),
+            input_group_names: state
+                .rows
+                .iter()
+                .map(|row| {
+                    let trimmed = row.group_name.trim();
+                    (!trimmed.is_empty()).then(|| trimmed.to_string())
+                })
+                .collect(),
+        };
+        let label = output_path
+            .file_name()
+            .map(|n| format!("Creating {}", n.to_string_lossy()))
+            .unwrap_or_else(|| "Creating merged streamlines".to_string());
+        self.pending_file_loads
+            .push(super::state::PendingFileLoad { job_id, label });
+        std::thread::spawn(move || {
+            let result = create_merged_streamline_source(&rows, &output_path, &options);
+            let _ = tx.send(WorkerMessage::MergedStreamlinesCreated {
+                job_id,
+                path: output_path,
+                result,
+            });
+        });
+    }
+
     pub(super) fn apply_loaded_trx(
         &mut self,
         path: PathBuf,
@@ -205,7 +250,10 @@ impl super::TrxViewerApp {
         self.viewport.volume_center = data.center();
         self.viewport.volume_extent = data.extent();
         if is_first {
-            self.viewport.camera_3d = OrbitCamera::new(self.viewport.volume_center, self.viewport.volume_extent * 0.8);
+            self.viewport.camera_3d = OrbitCamera::new(
+                self.viewport.volume_center,
+                self.viewport.volume_extent * 0.8,
+            );
             self.reset_slice_cameras();
         }
 
@@ -298,13 +346,31 @@ impl super::TrxViewerApp {
                 vol.dims[2] as f32,
             )) - vol.voxel_to_world(Vec3::ZERO))
             .length();
-            self.viewport.camera_3d = OrbitCamera::new(self.viewport.volume_center, self.viewport.volume_extent * 0.8);
+            self.viewport.camera_3d = OrbitCamera::new(
+                self.viewport.volume_center,
+                self.viewport.volume_extent * 0.8,
+            );
         }
 
         let slice_resources = SliceResources::new(&rs.device, &rs.queue, rs.target_format, &vol);
-        slice_resources.update_slice(&rs.queue, SliceAxis::Axial, self.viewport.slice_indices[0], &vol);
-        slice_resources.update_slice(&rs.queue, SliceAxis::Coronal, self.viewport.slice_indices[1], &vol);
-        slice_resources.update_slice(&rs.queue, SliceAxis::Sagittal, self.viewport.slice_indices[2], &vol);
+        slice_resources.update_slice(
+            &rs.queue,
+            SliceAxis::Axial,
+            self.viewport.slice_indices[0],
+            &vol,
+        );
+        slice_resources.update_slice(
+            &rs.queue,
+            SliceAxis::Coronal,
+            self.viewport.slice_indices[1],
+            &vol,
+        );
+        slice_resources.update_slice(
+            &rs.queue,
+            SliceAxis::Sagittal,
+            self.viewport.slice_indices[2],
+            &vol,
+        );
 
         let id = self.allocate_file_id(explicit_id);
 
@@ -487,12 +553,17 @@ impl super::TrxViewerApp {
 
     pub(super) fn reset_slice_cameras(&mut self) {
         let half_extents = self
-            .scene.nifti_files
+            .scene
+            .nifti_files
             .first()
             .map(|n| n.volume.slice_half_extents())
             .unwrap_or([self.viewport.volume_extent * 0.5; 3]);
         self.viewport.slice_cameras = [
-            OrthoSliceCamera::new(SliceAxis::Axial, self.viewport.volume_center, half_extents[0] * 2.0),
+            OrthoSliceCamera::new(
+                SliceAxis::Axial,
+                self.viewport.volume_center,
+                half_extents[0] * 2.0,
+            ),
             OrthoSliceCamera::new(
                 SliceAxis::Coronal,
                 self.viewport.volume_center,
@@ -547,4 +618,56 @@ impl super::TrxViewerApp {
         ];
         self.viewport.slice_world_offsets = [center.z, center.y, center.x];
     }
+}
+
+fn create_merged_streamline_source(
+    rows: &[super::state::MergeStreamlineRowState],
+    output_path: &std::path::Path,
+    options: &ConcatenateOptions,
+) -> Result<LoadedStreamlineSource, String> {
+    let tempdir = tempfile::TempDir::new().map_err(|err| err.to_string())?;
+    let mut owned_inputs = Vec::new();
+    for (idx, row) in rows.iter().enumerate() {
+        let Some(path) = row.source_path.as_ref() else {
+            continue;
+        };
+        let format = row
+            .detected_format
+            .or_else(|| trx_rs::detect_format(path).ok())
+            .ok_or_else(|| format!("Unsupported streamline input: {}", path.display()))?;
+        let any = match format {
+            Format::Trx => AnyTrxFile::load(path).map_err(|err| err.to_string())?,
+            Format::Tck | Format::Vtk | Format::TinyTrack => {
+                let header = row
+                    .reference_path
+                    .as_deref()
+                    .map(header_from_reference)
+                    .transpose()
+                    .map_err(|err| err.to_string())?;
+                let tractogram = trx_rs::read_tractogram(
+                    path,
+                    &ConversionOptions {
+                        header,
+                        ..ConversionOptions::default()
+                    },
+                )
+                .map_err(|err| err.to_string())?;
+                let temp_path = tempdir.path().join(format!("merge_input_{idx}.trx"));
+                trx_rs::write_tractogram(&temp_path, &tractogram, &ConversionOptions::default())
+                    .map_err(|err| err.to_string())?;
+                AnyTrxFile::load(&temp_path).map_err(|err| err.to_string())?
+            }
+        };
+        owned_inputs.push(any);
+    }
+
+    if owned_inputs.len() < 2 {
+        return Err("Choose at least two supported streamline inputs.".to_string());
+    }
+
+    let refs: Vec<&AnyTrxFile> = owned_inputs.iter().collect();
+    let merged = concatenate_any_trx(&refs, options).map_err(|err| err.to_string())?;
+    merged.save(output_path).map_err(|err| err.to_string())?;
+    let loaded = AnyTrxFile::load(output_path).map_err(|err| err.to_string())?;
+    super::TrxViewerApp::loaded_streamline_source_from_any(loaded)
 }

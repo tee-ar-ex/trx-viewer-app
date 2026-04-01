@@ -3,8 +3,8 @@ use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use glam::Vec3;
 use egui_snarl::NodeId;
+use glam::Vec3;
 use petgraph::Directed;
 use petgraph::algo::toposort;
 use petgraph::stable_graph::StableGraph;
@@ -15,8 +15,8 @@ use crate::data::loaded_files::{FileId, LoadedNifti, LoadedTrx, StreamlineBackin
 use crate::data::parcellation_data::ParcellationVolume;
 use crate::data::trx_data::{ColorMode, RenderStyle, TrxGpuData};
 
-use super::*;
 use super::jobs::{prime_expensive_record, sync_node_state_from_run_record};
+use super::*;
 
 pub fn evaluate_scene_plan(
     document: &WorkflowDocument,
@@ -764,6 +764,7 @@ fn evaluate_node(
             voxel_size_mm,
             threshold,
             smooth_sigma,
+            min_component_volume_mm3,
             opacity,
         } => {
             let flow = expect_streamline_input(inputs, "Bundle Surface Build")?;
@@ -775,6 +776,7 @@ fn evaluate_node(
                 voxel_size_mm: *voxel_size_mm,
                 threshold: *threshold,
                 smooth_sigma: *smooth_sigma,
+                min_component_volume_mm3: *min_component_volume_mm3,
                 opacity: *opacity,
             };
             let upstream_stale = inputs.iter().flatten().any(|value| value.stale);
@@ -954,6 +956,7 @@ fn evaluate_node(
                 voxel_size_mm: bundle.voxel_size_mm,
                 threshold: bundle.threshold,
                 smooth_sigma: bundle.smooth_sigma,
+                min_component_volume_mm3: bundle.min_component_volume_mm3,
                 opacity: bundle.opacity,
                 outline_thickness: *outline_thickness,
             };

@@ -16,9 +16,9 @@ use crate::renderer::glyph_renderer::GlyphResources;
 use crate::renderer::mesh_renderer::MeshResources;
 use crate::renderer::streamline_renderer::{AllStreamlineResources, StreamlineResources};
 
-use super::*;
 use super::evaluate::{materialize_merged_streamlines, robust_range};
 use super::project_io::{relativized_document, resolve_document_asset_paths};
+use super::*;
 
 pub(crate) fn workflow_job_kind_title(kind: WorkflowJobKind) -> &'static str {
     match kind {
@@ -66,7 +66,8 @@ impl crate::app::TrxViewerApp {
                             WorkflowJobOutput::ReactiveStreamline(flow) => {
                                 let summary =
                                     format!("{} streamlines", flow.selected_streamlines.len());
-                                self.workflow.execution_cache
+                                self.workflow
+                                    .execution_cache
                                     .derived_streamline_cache
                                     .insert(
                                         node_uuid,
@@ -77,7 +78,8 @@ impl crate::app::TrxViewerApp {
                             WorkflowJobOutput::SurfaceQuery(flow) => {
                                 let summary =
                                     format!("{} streamlines", flow.selected_streamlines.len());
-                                self.workflow.execution_cache
+                                self.workflow
+                                    .execution_cache
                                     .surface_query_cache
                                     .insert(node_uuid, CachedSurfaceQuery { fingerprint, flow });
                                 mark_expensive_success(record, fingerprint, summary);
@@ -87,7 +89,8 @@ impl crate::app::TrxViewerApp {
                                     "Surface streamline map for surface {}",
                                     map.surface_id
                                 );
-                                self.workflow.execution_cache
+                                self.workflow
+                                    .execution_cache
                                     .surface_streamline_map_cache
                                     .insert(
                                         node_uuid,
@@ -116,7 +119,8 @@ impl crate::app::TrxViewerApp {
                                 } else {
                                     format!("{} bundle surface mesh(es)", meshes.len())
                                 };
-                                self.workflow.execution_cache
+                                self.workflow
+                                    .execution_cache
                                     .bundle_surface_mesh_cache
                                     .insert(
                                         node_uuid,
@@ -139,7 +143,8 @@ impl crate::app::TrxViewerApp {
                                         "Boundary field ready".to_string(),
                                     );
                                 } else {
-                                    self.workflow.execution_cache
+                                    self.workflow
+                                        .execution_cache
                                         .boundary_field_cache
                                         .remove(&node_uuid);
                                     mark_expensive_success(
@@ -174,7 +179,8 @@ impl crate::app::TrxViewerApp {
         };
         record.current_fingerprint = Some(fingerprint);
         record.status = WorkflowExecutionStatus::Queued;
-        self.workflow.jobs_in_flight
+        self.workflow
+            .jobs_in_flight
             .insert(node_uuid, (kind, fingerprint));
         let tx = self.workflow.job_tx.clone();
         std::thread::spawn(move || {
@@ -195,7 +201,8 @@ impl crate::app::TrxViewerApp {
 
     pub(in crate::app) fn queue_workflow_jobs(&mut self) -> bool {
         for plan in self
-            .workflow.runtime
+            .workflow
+            .runtime
             .scene_plan
             .reactive_streamline_plans
             .clone()
@@ -287,14 +294,16 @@ impl crate::app::TrxViewerApp {
         }
 
         for plan in self
-            .workflow.runtime
+            .workflow
+            .runtime
             .scene_plan
             .boundary_field_plans
             .clone()
         {
             let fingerprint = workflow_boundary_plan_fingerprint(&plan);
             if should_queue_expensive_job(
-                self.workflow.execution_cache
+                self.workflow
+                    .execution_cache
                     .node_runs
                     .get(&plan.build_node_uuid),
                 fingerprint,
@@ -312,14 +321,16 @@ impl crate::app::TrxViewerApp {
         }
 
         for plan in self
-            .workflow.runtime
+            .workflow
+            .runtime
             .scene_plan
             .bundle_surface_plans
             .clone()
         {
             let fingerprint = workflow_bundle_plan_fingerprint(&plan);
             let record = self
-                .workflow.execution_cache
+                .workflow
+                .execution_cache
                 .node_runs
                 .entry(plan.build_node_uuid)
                 .or_default();
@@ -337,7 +348,8 @@ impl crate::app::TrxViewerApp {
 
         for draw in self.workflow.runtime.scene_plan.bundle_draws.clone() {
             let boundary_field = draw.boundary_field_node_uuid.and_then(|uuid| {
-                self.workflow.execution_cache
+                self.workflow
+                    .execution_cache
                     .boundary_field_cache
                     .get(&uuid)
                     .map(|cache| cache.field.clone())
@@ -348,7 +360,8 @@ impl crate::app::TrxViewerApp {
             let fingerprint = workflow_bundle_display_fingerprint(
                 &draw,
                 draw.boundary_field_node_uuid.and_then(|uuid| {
-                    self.workflow.execution_cache
+                    self.workflow
+                        .execution_cache
                         .boundary_field_cache
                         .get(&uuid)
                         .map(|cache| cache.fingerprint)
@@ -368,6 +381,7 @@ impl crate::app::TrxViewerApp {
                     voxel_size_mm: draw.voxel_size_mm,
                     threshold: draw.threshold,
                     smooth_sigma: draw.smooth_sigma,
+                    min_component_volume_mm3: draw.min_component_volume_mm3,
                     opacity: draw.opacity,
                 };
                 self.queue_workflow_job(
@@ -438,21 +452,24 @@ impl crate::app::TrxViewerApp {
         }
 
         let active_streamline_ids: HashSet<FileId> = self
-            .workflow.runtime
+            .workflow
+            .runtime
             .scene_plan
             .streamline_draws
             .iter()
             .map(|draw| draw.draw_id)
             .collect();
         let active_bundle_ids: HashSet<FileId> = self
-            .workflow.runtime
+            .workflow
+            .runtime
             .scene_plan
             .bundle_draws
             .iter()
             .map(|draw| draw.draw_id)
             .collect();
         let workflow_ids: HashSet<FileId> = self
-            .workflow.display_runtimes
+            .workflow
+            .display_runtimes
             .values()
             .map(|runtime| runtime.draw_id)
             .collect();
@@ -464,13 +481,15 @@ impl crate::app::TrxViewerApp {
             for draw in &self.workflow.runtime.scene_plan.streamline_draws {
                 let fingerprint = workflow_streamline_fingerprint(draw);
                 let runtime = self
-                    .workflow.display_runtimes
+                    .workflow
+                    .display_runtimes
                     .get_mut(&draw.node_uuid)
                     .expect("draw runtime allocated during evaluation");
                 let resource_exists = all.entries.iter().any(|(id, _)| *id == draw.draw_id);
                 if draw.render_style == RenderStyle::Tubes
                     && !self
-                        .workflow.execution_cache
+                        .workflow
+                        .execution_cache
                         .node_runs
                         .get(&draw.node_uuid)
                         .is_some_and(|record| record.last_success_fingerprint == Some(fingerprint))
@@ -485,7 +504,8 @@ impl crate::app::TrxViewerApp {
                 let mut resource = StreamlineResources::new(&rs.device, rs.target_format, &subset);
                 if draw.render_style == RenderStyle::Tubes {
                     let Some(cache) = self
-                        .workflow.execution_cache
+                        .workflow
+                        .execution_cache
                         .tube_geometry_cache
                         .get(&draw.node_uuid)
                         .filter(|cache| cache.fingerprint == fingerprint)
@@ -517,13 +537,15 @@ impl crate::app::TrxViewerApp {
         }
 
         let active_boundary_field_ids: HashSet<WorkflowNodeUuid> = self
-            .workflow.runtime
+            .workflow
+            .runtime
             .scene_plan
             .bundle_draws
             .iter()
             .filter_map(|draw| draw.boundary_field_node_uuid)
             .chain(
-                self.workflow.runtime
+                self.workflow
+                    .runtime
                     .scene_plan
                     .boundary_glyph_draws
                     .iter()
@@ -531,30 +553,35 @@ impl crate::app::TrxViewerApp {
             )
             .collect();
 
-        self.workflow.execution_cache
+        self.workflow
+            .execution_cache
             .boundary_field_cache
             .retain(|uuid, _| active_boundary_field_ids.contains(uuid));
 
         if let Some(glyph_resources) = renderer.callback_resources.get_mut::<GlyphResources>() {
             if let Some(draw) = self
-                .workflow.runtime
+                .workflow
+                .runtime
                 .scene_plan
                 .boundary_glyph_draws
                 .iter()
                 .find(|draw| draw.visible)
                 .or_else(|| {
-                    self.workflow.runtime
+                    self.workflow
+                        .runtime
                         .scene_plan
                         .boundary_glyph_draws
                         .first()
                 })
             {
                 if let Some(cache) = self
-                    .workflow.execution_cache
+                    .workflow
+                    .execution_cache
                     .boundary_field_cache
                     .get(&draw.build_node_uuid)
                 {
-                    let boundary_field_changed = self.viewport.boundary_field_revision != cache.fingerprint;
+                    let boundary_field_changed =
+                        self.viewport.boundary_field_revision != cache.fingerprint;
                     let field = cache.field.clone();
                     glyph_resources.set_field(
                         &rs.device,
@@ -584,18 +611,21 @@ impl crate::app::TrxViewerApp {
                 let display_fingerprint = workflow_bundle_display_fingerprint(
                     draw,
                     draw.boundary_field_node_uuid.and_then(|uuid| {
-                        self.workflow.execution_cache
+                        self.workflow
+                            .execution_cache
                             .boundary_field_cache
                             .get(&uuid)
                             .map(|cache| cache.fingerprint)
                     }),
                 );
                 let runtime = self
-                    .workflow.display_runtimes
+                    .workflow
+                    .display_runtimes
                     .get_mut(&draw.node_uuid)
                     .expect("bundle runtime allocated during evaluation");
                 let Some(cache) = self
-                    .workflow.execution_cache
+                    .workflow
+                    .execution_cache
                     .bundle_surface_mesh_cache
                     .get(&draw.node_uuid)
                     .filter(|cache| cache.fingerprint == display_fingerprint)
@@ -603,7 +633,8 @@ impl crate::app::TrxViewerApp {
                     continue;
                 };
                 if !self
-                    .workflow.execution_cache
+                    .workflow
+                    .execution_cache
                     .node_runs
                     .get(&draw.node_uuid)
                     .is_some_and(|record| {
@@ -633,7 +664,8 @@ impl crate::app::TrxViewerApp {
             {
                 mesh_resources.clear_bundle_mesh(draw_id);
                 if let Some(runtime) = self
-                    .workflow.display_runtimes
+                    .workflow
+                    .display_runtimes
                     .values_mut()
                     .find(|runtime| runtime.draw_id == draw_id)
                 {
@@ -870,7 +902,8 @@ impl crate::app::TrxViewerApp {
 
     pub(in crate::app) fn save_streamline_node(&mut self, node_uuid: WorkflowNodeUuid) {
         let Some(plan) = self
-            .workflow.runtime
+            .workflow
+            .runtime
             .save_streamline_targets
             .get(&node_uuid)
             .cloned()
@@ -882,7 +915,8 @@ impl crate::app::TrxViewerApp {
 
         match save_streamline_plan(&plan) {
             Ok(()) => {
-                self.workflow.node_feedback
+                self.workflow
+                    .node_feedback
                     .insert(node_uuid, format!("Saved {}", plan.output_path.display()));
                 self.status_msg = Some(format!(
                     "Saved streamlines to {}",
@@ -1164,6 +1198,7 @@ fn build_bundle_surface_meshes_with_color_mode(
                 plan.voxel_size_mm,
                 plan.threshold,
                 plan.smooth_sigma,
+                plan.min_component_volume_mm3,
                 strategy,
                 boundary_field,
             )

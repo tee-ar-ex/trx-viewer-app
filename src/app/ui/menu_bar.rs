@@ -5,6 +5,7 @@ pub struct MenuAction {
     pub save_workflow_project_as: bool,
     pub open_trx: bool,
     pub import_streamlines: bool,
+    pub create_streamline_merge: bool,
     pub open_nifti: bool,
     pub open_gifti: bool,
     pub open_parcellation: bool,
@@ -22,6 +23,7 @@ pub fn show_menu_bar(ctx: &egui::Context) -> MenuAction {
         save_workflow_project_as: false,
         open_trx: false,
         import_streamlines: false,
+        create_streamline_merge: false,
         open_nifti: false,
         open_gifti: false,
         open_parcellation: false,
@@ -56,6 +58,10 @@ pub fn show_menu_bar(ctx: &egui::Context) -> MenuAction {
                 }
                 if ui.button("Import Streamlines...").clicked() {
                     action.import_streamlines = true;
+                    ui.close();
+                }
+                if ui.button("Create Streamline File From Merge...").clicked() {
+                    action.create_streamline_merge = true;
                     ui.close();
                 }
                 if ui.button("Open NIfTI...").clicked() {

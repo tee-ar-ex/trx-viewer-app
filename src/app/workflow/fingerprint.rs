@@ -60,6 +60,7 @@ pub(crate) fn workflow_bundle_build_fingerprint(draw: &BundleDrawPlan) -> u64 {
     draw.voxel_size_mm.to_bits().hash(&mut hasher);
     draw.threshold.to_bits().hash(&mut hasher);
     draw.smooth_sigma.to_bits().hash(&mut hasher);
+    draw.min_component_volume_mm3.to_bits().hash(&mut hasher);
     draw.opacity.to_bits().hash(&mut hasher);
     hash_flow(&draw.flow, &mut hasher);
     hasher.finish()
@@ -83,6 +84,7 @@ pub(crate) fn workflow_bundle_plan_fingerprint(plan: &BundleSurfacePlan) -> u64 
     plan.voxel_size_mm.to_bits().hash(&mut hasher);
     plan.threshold.to_bits().hash(&mut hasher);
     plan.smooth_sigma.to_bits().hash(&mut hasher);
+    plan.min_component_volume_mm3.to_bits().hash(&mut hasher);
     plan.opacity.to_bits().hash(&mut hasher);
     hash_flow(&plan.flow, &mut hasher);
     hasher.finish()

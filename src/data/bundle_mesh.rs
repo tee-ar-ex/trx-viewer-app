@@ -315,17 +315,28 @@ fn gaussian_blur_3d(data: &[f32], nx: usize, ny: usize, nz: usize, sigma: f32) -
     dst
 }
 
-// ── Largest connected component ───────────────────────────────────────────────
+// ── Connected components ─────────────────────────────────────────────────────
 
-/// Retains only the triangles belonging to the largest connected component.
+#[derive(Clone)]
+struct TriangleComponent {
+    indices: Vec<u32>,
+    volume_mm3: f32,
+}
+
+/// Partition triangles into connected components.
 ///
-/// Connectivity is determined by shared vertex *positions* (quantized to 0.1 mm)
-/// rather than shared vertex indices, because `mcubes` may emit duplicate
-/// vertices for adjacent triangles with no shared indices.
-fn largest_component(vertices: &[BundleMeshVertex], indices: &[u32]) -> Vec<u32> {
+/// Connectivity is determined by shared vertex positions rather than shared
+/// indices, because `mcubes` may emit duplicate vertices for adjacent triangles.
+fn connected_components(vertices: &[BundleMeshVertex], indices: &[u32]) -> Vec<TriangleComponent> {
     let n_tris = indices.len() / 3;
-    if n_tris <= 1 {
-        return indices.to_vec();
+    if n_tris == 0 {
+        return Vec::new();
+    }
+    if n_tris == 1 {
+        return vec![TriangleComponent {
+            indices: indices.to_vec(),
+            volume_mm3: component_volume_mm3(vertices, indices),
+        }];
     }
 
     // Build quantized-position → triangle list.
@@ -346,14 +357,14 @@ fn largest_component(vertices: &[BundleMeshVertex], indices: &[u32]) -> Vec<u32>
     }
 
     let mut component: Vec<u32> = vec![u32::MAX; n_tris];
-    let mut comp_sizes: Vec<usize> = Vec::new();
+    let mut components = Vec::<TriangleComponent>::new();
     let mut queue: Vec<usize> = Vec::new();
 
     for start in 0..n_tris {
         if component[start] != u32::MAX {
             continue;
         }
-        let comp_id = comp_sizes.len() as u32;
+        let comp_id = components.len() as u32;
         queue.clear();
         queue.push(start);
         component[start] = comp_id;
@@ -379,22 +390,31 @@ fn largest_component(vertices: &[BundleMeshVertex], indices: &[u32]) -> Vec<u32>
                 }
             }
         }
-        comp_sizes.push(queue.len());
+        let component_indices = indices
+            .chunks(3)
+            .enumerate()
+            .filter(|(ti, _)| component[*ti] == comp_id)
+            .flat_map(|(_, tri)| tri.iter().copied())
+            .collect::<Vec<_>>();
+        let volume_mm3 = component_volume_mm3(vertices, &component_indices);
+        components.push(TriangleComponent {
+            indices: component_indices,
+            volume_mm3,
+        });
     }
 
-    let best = comp_sizes
-        .iter()
-        .enumerate()
-        .max_by_key(|&(_, &s)| s)
-        .map(|(i, _)| i as u32)
-        .unwrap_or(0);
+    components
+}
 
-    indices
-        .chunks(3)
-        .zip(component.iter())
-        .filter(|(_, c)| **c == best)
-        .flat_map(|(tri, _)| tri.iter().copied())
-        .collect()
+fn component_volume_mm3(vertices: &[BundleMeshVertex], indices: &[u32]) -> f32 {
+    let mut signed_volume = 0.0f32;
+    for tri in indices.chunks_exact(3) {
+        let a = Vec3::from(vertices[tri[0] as usize].position);
+        let b = Vec3::from(vertices[tri[1] as usize].position);
+        let c = Vec3::from(vertices[tri[2] as usize].position);
+        signed_volume += a.dot(b.cross(c)) / 6.0;
+    }
+    signed_volume.abs()
 }
 
 const WELD_QUANT: f32 = 1e-4;
@@ -539,6 +559,7 @@ pub fn build_bundle_mesh(
     voxel_size: f32,
     threshold: f32,
     smooth_sigma: f32,
+    min_component_volume_mm3: f32,
     color_strategy: BundleMeshColorStrategy,
     boundary_field: Option<&BoundaryContactField>,
 ) -> Option<BundleMesh> {
@@ -680,8 +701,13 @@ pub fn build_bundle_mesh(
 
     let raw_indices: Vec<u32> = mesh.indices.iter().map(|&i| i as u32).collect();
 
-    // ── 7. Keep only the largest connected component ─────────────────────────
-    let indices = largest_component(&vertices, &raw_indices);
+    // ── 7. Filter connected components by enclosed volume ───────────────────
+    let min_component_volume_mm3 = min_component_volume_mm3.max(0.0);
+    let indices = connected_components(&vertices, &raw_indices)
+        .into_iter()
+        .filter(|component| component.volume_mm3 >= min_component_volume_mm3)
+        .flat_map(|component| component.indices)
+        .collect::<Vec<_>>();
 
     if indices.is_empty() {
         return None;
@@ -695,8 +721,8 @@ pub fn build_bundle_mesh(
 #[cfg(test)]
 mod tests {
     use super::{
-        BundleMeshVertex, TAUBIN_SMOOTHING_ITERS, apply_taubin_smoothing, group_neighbors,
-        welded_vertex_groups,
+        BundleMeshVertex, TAUBIN_SMOOTHING_ITERS, apply_taubin_smoothing, component_volume_mm3,
+        connected_components, group_neighbors, welded_vertex_groups,
     };
     use glam::Vec3;
 
@@ -742,5 +768,38 @@ mod tests {
             .fold(Vec3::ZERO, |acc, p| acc + p)
             / group_positions.len() as f32;
         assert!(centroid.z > 0.0);
+    }
+
+    #[test]
+    fn connected_components_preserve_disconnected_meshes() {
+        let vertices = vec![
+            vertex([0.0, 0.0, 0.0]),
+            vertex([1.0, 0.0, 0.0]),
+            vertex([0.0, 1.0, 0.0]),
+            vertex([5.0, 5.0, 0.0]),
+            vertex([6.0, 5.0, 0.0]),
+            vertex([5.0, 6.0, 0.0]),
+        ];
+        let indices = vec![0, 1, 2, 3, 4, 5];
+        let components = connected_components(&vertices, &indices);
+        assert_eq!(components.len(), 2);
+        assert_eq!(components[0].indices.len(), 3);
+        assert_eq!(components[1].indices.len(), 3);
+    }
+
+    #[test]
+    fn component_volume_uses_absolute_signed_volume() {
+        let vertices = vec![
+            vertex([0.0, 0.0, 0.0]),
+            vertex([1.0, 0.0, 0.0]),
+            vertex([0.0, 1.0, 0.0]),
+            vertex([0.0, 0.0, 1.0]),
+        ];
+        let ccw = vec![0, 2, 1, 0, 1, 3, 0, 3, 2, 1, 2, 3];
+        let cw = vec![0, 1, 2, 0, 3, 1, 0, 2, 3, 1, 3, 2];
+        let ccw_volume = component_volume_mm3(&vertices, &ccw);
+        let cw_volume = component_volume_mm3(&vertices, &cw);
+        assert!(ccw_volume > 0.0);
+        assert!((ccw_volume - cw_volume).abs() < 1e-6);
     }
 }

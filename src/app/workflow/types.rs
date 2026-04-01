@@ -9,7 +9,9 @@ use egui_tiles::{Container, Linear, LinearDir, Tile, Tiles, Tree};
 
 use crate::data::bundle_mesh::BundleMesh;
 use crate::data::gifti_data::GiftiSurfaceData;
-use crate::data::loaded_files::{FileId, LoadedNifti, LoadedTrx, StreamlineBacking, VolumeColormap};
+use crate::data::loaded_files::{
+    FileId, LoadedNifti, LoadedTrx, StreamlineBacking, VolumeColormap,
+};
 use crate::data::orientation_field::{
     BoundaryContactField, BoundaryGlyphColorMode, BoundaryGlyphNormalization,
 };
@@ -98,6 +100,8 @@ pub enum WorkflowNodeKind {
         voxel_size_mm: f32,
         threshold: f32,
         smooth_sigma: f32,
+        #[serde(default = "default_bundle_surface_min_component_volume_mm3")]
+        min_component_volume_mm3: f32,
         opacity: f32,
     },
     BoundaryFieldBuild {
@@ -202,6 +206,10 @@ pub fn default_boundary_glyph_min_contacts() -> u32 {
 
 pub fn default_bundle_surface_outline_thickness() -> f32 {
     1.15
+}
+
+pub fn default_bundle_surface_min_component_volume_mm3() -> f32 {
+    0.0
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -456,6 +464,7 @@ pub struct BundleDrawPlan {
     pub voxel_size_mm: f32,
     pub threshold: f32,
     pub smooth_sigma: f32,
+    pub min_component_volume_mm3: f32,
     pub opacity: f32,
     pub outline_thickness: f32,
 }
@@ -561,6 +570,7 @@ pub struct BundleSurfacePlan {
     pub voxel_size_mm: f32,
     pub threshold: f32,
     pub smooth_sigma: f32,
+    pub min_component_volume_mm3: f32,
     pub opacity: f32,
 }
 

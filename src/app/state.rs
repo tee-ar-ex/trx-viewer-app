@@ -11,10 +11,10 @@ use crate::app::workflow::{
     WorkflowJobKind, WorkflowJobMessage, WorkflowNodeUuid, WorkflowRuntime, WorkflowSelection,
     default_document,
 };
-use crate::data::loaded_files::{FileId, LoadedNifti, LoadedTrx, StreamlineBacking};
-use crate::data::orientation_field::BoundaryContactField;
 use crate::data::gifti_data::GiftiSurfaceData;
+use crate::data::loaded_files::{FileId, LoadedNifti, LoadedTrx, StreamlineBacking};
 use crate::data::nifti_data::NiftiVolume;
+use crate::data::orientation_field::BoundaryContactField;
 use crate::data::parcellation_data::ParcellationVolume;
 use crate::data::trx_data::TrxGpuData;
 use crate::renderer::camera::{OrbitCamera, OrthoSliceCamera};
@@ -257,6 +257,70 @@ impl ImportDialogState {
     }
 }
 
+#[derive(Clone, Default)]
+pub struct MergeStreamlineRowState {
+    pub source_path: Option<PathBuf>,
+    pub detected_format: Option<Format>,
+    pub reference_path: Option<PathBuf>,
+    pub group_name: String,
+}
+
+#[derive(Clone, Default)]
+pub struct MergeStreamlinesDialogState {
+    pub open: bool,
+    pub rows: Vec<MergeStreamlineRowState>,
+    pub output_path: Option<PathBuf>,
+    pub delete_dps: bool,
+    pub delete_dpv: bool,
+    pub delete_groups: bool,
+    pub positions_dtype: Option<FormatlessDType>,
+    pub error_msg: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FormatlessDType {
+    Float16,
+    Float32,
+    Float64,
+}
+
+impl FormatlessDType {
+    pub const ALL: [Self; 3] = [Self::Float16, Self::Float32, Self::Float64];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Float16 => "float16",
+            Self::Float32 => "float32",
+            Self::Float64 => "float64",
+        }
+    }
+}
+
+impl From<FormatlessDType> for trx_rs::DType {
+    fn from(value: FormatlessDType) -> Self {
+        match value {
+            FormatlessDType::Float16 => trx_rs::DType::Float16,
+            FormatlessDType::Float32 => trx_rs::DType::Float32,
+            FormatlessDType::Float64 => trx_rs::DType::Float64,
+        }
+    }
+}
+
+impl MergeStreamlinesDialogState {
+    pub fn open(&mut self) {
+        self.open = true;
+        self.error_msg = None;
+        if self.rows.len() < 2 {
+            self.rows.resize_with(2, MergeStreamlineRowState::default);
+        }
+    }
+
+    pub fn close(&mut self) {
+        self.open = false;
+        self.error_msg = None;
+    }
+}
+
 pub struct LoadedStreamlineSource {
     pub data: TrxGpuData,
     pub backing: StreamlineBacking,
@@ -416,7 +480,8 @@ impl ViewportState {
         }
 
         let Some(field) = self.boundary_field.as_ref() else {
-            let Some((min_pos, max_pos)) = self.gifti_axis_bounds(gifti_surfaces, axis_index) else {
+            let Some((min_pos, max_pos)) = self.gifti_axis_bounds(gifti_surfaces, axis_index)
+            else {
                 return false;
             };
             let span = (max_pos - min_pos).abs();
@@ -504,6 +569,11 @@ pub enum WorkerMessage {
         path: PathBuf,
         result: Result<LoadedStreamlineSource, String>,
     },
+    MergedStreamlinesCreated {
+        job_id: u64,
+        path: PathBuf,
+        result: Result<LoadedStreamlineSource, String>,
+    },
     NiftiLoaded {
         job_id: u64,
         path: PathBuf,
@@ -537,6 +607,16 @@ mod tests {
         assert_eq!(state.source_path.as_deref(), Some(path.as_path()));
         assert_eq!(state.detected_format, Some(Format::Tck));
         assert!(state.reference_path.is_none());
+        assert!(state.error_msg.is_none());
+    }
+
+    #[test]
+    fn merge_dialog_open_initializes_two_rows() {
+        let mut state = MergeStreamlinesDialogState::default();
+        state.open();
+        assert!(state.open);
+        assert_eq!(state.rows.len(), 2);
+        assert!(state.output_path.is_none());
         assert!(state.error_msg.is_none());
     }
 }
