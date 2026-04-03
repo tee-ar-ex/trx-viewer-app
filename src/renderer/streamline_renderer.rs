@@ -381,26 +381,6 @@ impl StreamlineResources {
         );
     }
 
-    /// Re-upload only the color buffer.
-    pub fn update_colors(&self, queue: &wgpu::Queue, colors: &[[f32; 4]]) {
-        queue.write_buffer(&self.color_buffer, 0, bytemuck::cast_slice(colors));
-    }
-
-    /// Replace the line index buffer contents and update the draw count.
-    pub fn update_indices(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, indices: &[u32]) {
-        let new_size = (indices.len() * std::mem::size_of::<u32>()) as u64;
-        if new_size <= self.index_buffer.size() {
-            queue.write_buffer(&self.index_buffer, 0, bytemuck::cast_slice(indices));
-        } else {
-            self.index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("streamline_indices"),
-                contents: bytemuck::cast_slice(indices),
-                usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
-            });
-        }
-        self.num_indices = indices.len() as u32;
-    }
-
     /// Replace the tube geometry buffers.
     pub fn update_tube_geometry(
         &mut self,

@@ -1,7 +1,5 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
-use std::path::Path;
-
 use crate::data::gifti_data::GiftiSurfaceData;
 use glam::Vec3;
 use trx_rs::{
@@ -165,12 +163,6 @@ pub(crate) fn group_name_color(name: &str) -> Option<[f32; 4]> {
 }
 
 impl TrxGpuData {
-    /// Load a TRX file and produce GPU-ready data with direction-RGB coloring.
-    pub fn load(path: &Path) -> anyhow::Result<Self> {
-        let any = AnyTrxFile::load(path)?;
-        Self::from_any_trx(&any)
-    }
-
     pub fn from_tractogram(tractogram: &Tractogram) -> anyhow::Result<Self> {
         let positions = tractogram.positions().to_vec();
         let nb_vertices = positions.len();
@@ -273,101 +265,6 @@ impl TrxGpuData {
             ColorMode::Group => self.compute_group_colors(),
             ColorMode::Uniform(c) => vec![*c; self.nb_vertices],
         };
-    }
-
-    /// Compute the natural (robust) scalar range for the given color mode, if applicable.
-    pub fn scalar_range_for_mode(&self, mode: &ColorMode) -> Option<(f32, f32)> {
-        match mode {
-            ColorMode::Dpv(name) => self
-                .dpv_data
-                .iter()
-                .find(|(n, _)| n == name)
-                .map(|(_, data)| scalar_auto_range(data)),
-            ColorMode::Dps(name) => self
-                .dps_data
-                .iter()
-                .find(|(n, _)| n == name)
-                .map(|(_, data)| scalar_auto_range(data)),
-            _ => None,
-        }
-    }
-
-    /// Build index buffer applying all active filters: group visibility, max count,
-    /// ordering (for random subsetting), and optional sphere query.
-    pub fn build_index_buffer(
-        &self,
-        visible_groups: &[bool],
-        max_count: usize,
-        ordering: &[u32],
-        sphere_indices: Option<&HashSet<u32>>,
-        surface_indices: Option<&HashSet<u32>>,
-    ) -> Vec<u32> {
-        let selected = self.filtered_streamline_indices(
-            visible_groups,
-            max_count,
-            ordering,
-            sphere_indices,
-            surface_indices,
-        );
-
-        // Step 4: Build line-segment index pairs
-        let mut indices = Vec::with_capacity(selected.len() * 100); // rough estimate
-        for &si in &selected {
-            let s = si as usize;
-            if s + 1 < self.offsets.len() {
-                let start = self.offsets[s];
-                let end = self.offsets[s + 1];
-                for j in start..end.saturating_sub(1) {
-                    indices.push(j);
-                    indices.push(j + 1);
-                }
-            }
-        }
-        indices
-    }
-
-    /// Return the selected streamline indices after applying active filters.
-    pub fn filtered_streamline_indices(
-        &self,
-        visible_groups: &[bool],
-        max_count: usize,
-        ordering: &[u32],
-        sphere_indices: Option<&HashSet<u32>>,
-        surface_indices: Option<&HashSet<u32>>,
-    ) -> Vec<u32> {
-        // Step 1: Collect visible streamline indices
-        let visible_set: Vec<u32> = if self.groups.is_empty() {
-            (0..self.nb_streamlines as u32).collect()
-        } else {
-            let mut v = Vec::new();
-            for (i, (_, members)) in self.groups.iter().enumerate() {
-                if i < visible_groups.len() && !visible_groups[i] {
-                    continue;
-                }
-                v.extend_from_slice(members);
-            }
-            v
-        };
-
-        // Step 2: Spatial filter intersections
-        let filtered: Vec<u32> = visible_set
-            .into_iter()
-            .filter(|idx| sphere_indices.is_none_or(|set| set.contains(idx)))
-            .filter(|idx| surface_indices.is_none_or(|set| set.contains(idx)))
-            .collect();
-
-        // Step 3: Apply ordering and max count
-        if ordering.len() == self.nb_streamlines {
-            let filtered_set: HashSet<u32> = filtered.into_iter().collect();
-            ordering
-                .iter()
-                .copied()
-                .filter(|idx| filtered_set.contains(idx))
-                .take(max_count)
-                .collect()
-        } else {
-            filtered.into_iter().take(max_count).collect()
-        }
     }
 
     /// Query streamlines intersecting a sphere. Returns matching streamline indices.
@@ -672,16 +569,6 @@ impl TrxGpuData {
             all_indices,
             aabbs,
         }
-    }
-
-    /// Estimate tube mesh buffer size before building, using original point counts.
-    pub fn estimate_tube_mesh_bytes(&self, selected_streamlines: &[u32], sides: u32) -> usize {
-        estimate_tube_mesh_bytes_from_offsets(
-            selected_streamlines
-                .iter()
-                .map(|&si| (self.offsets[si as usize + 1] - self.offsets[si as usize]) as usize),
-            sides,
-        )
     }
 
     pub fn center(&self) -> Vec3 {
@@ -1000,32 +887,6 @@ pub fn build_tube_vertices_from_data(
     }
 
     (vertices, indices)
-}
-
-pub fn estimate_tube_mesh_bytes_from_offsets<I>(point_counts: I, sides: u32) -> usize
-where
-    I: IntoIterator<Item = usize>,
-{
-    let sides = sides.max(3) as usize;
-    let mut vertices = 0usize;
-    let mut indices = 0usize;
-
-    for point_count in point_counts {
-        if point_count < 2 {
-            continue;
-        }
-        vertices = vertices.saturating_add(point_count.saturating_mul(sides).saturating_add(2));
-        indices = indices.saturating_add(
-            (point_count - 1)
-                .saturating_mul(sides)
-                .saturating_mul(6)
-                .saturating_add(6usize.saturating_mul(sides)),
-        );
-    }
-
-    vertices
-        .saturating_mul(std::mem::size_of::<TubeMeshVertex>())
-        .saturating_add(indices.saturating_mul(std::mem::size_of::<u32>()))
 }
 
 fn compute_streamline_tangents(points: &[TubePoint]) -> Vec<Vec3> {

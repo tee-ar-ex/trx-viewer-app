@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use egui::emath::TSTransform;
 use egui::{Pos2, Rect};
 use egui_snarl::{
-    InPin, InPinId, NodeId, OutPin, OutPinId, Snarl,
+    InPin, NodeId, OutPin, Snarl,
     ui::{PinInfo, SnarlViewer},
 };
 

@@ -133,6 +133,7 @@ impl Default for View2DState {
     }
 }
 
+#[allow(dead_code)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum SceneLightingPreset {
     Flat,
@@ -140,6 +141,7 @@ pub enum SceneLightingPreset {
     Studio,
 }
 
+#[allow(dead_code)]
 impl SceneLightingPreset {
     pub fn label(self) -> &'static str {
         match self {
@@ -207,6 +209,7 @@ impl Default for SceneLightingParams {
     }
 }
 
+#[allow(dead_code)]
 pub struct LoadedGiftiSurface {
     pub id: usize,
     pub name: String,

@@ -76,6 +76,7 @@ pub fn evaluate_scene_plan(
             execution: None,
             fingerprint: None,
             last_result_summary: None,
+            available_streamline_groups: Vec::new(),
         };
         let result = evaluate_node(
             node,
@@ -96,6 +97,15 @@ pub fn evaluate_scene_plan(
 
         match result {
             Ok(Some(value)) => {
+                if let WorkflowValue::Streamline(flow) = &value.value {
+                    node_state.available_streamline_groups = flow
+                        .dataset
+                        .gpu_data
+                        .groups
+                        .iter()
+                        .map(|(name, _)| name.clone())
+                        .collect();
+                }
                 if node_state.summary == node.kind.title() {
                     node_state.summary = summarize_value(&value.value);
                 }
@@ -263,6 +273,12 @@ fn evaluate_node(
         }
         WorkflowNodeKind::GroupSelect { groups_csv } => {
             let flow = expect_streamline_input(inputs, "Group Select")?;
+            if flow.dataset.gpu_data.groups.is_empty() {
+                return Err(
+                    "Group Select needs streamline input with group memberships, but the input has no groups."
+                        .to_string(),
+                );
+            }
             let labels = parse_csv_set(groups_csv);
             if labels.is_empty() {
                 return Ok(Some(WorkflowValue::Streamline(flow).into()));

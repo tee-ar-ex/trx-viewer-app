@@ -62,6 +62,7 @@ impl VolumeColormap {
     ];
 }
 
+#[allow(dead_code)]
 pub struct LoadedNifti {
     pub id: FileId,
     pub name: String,

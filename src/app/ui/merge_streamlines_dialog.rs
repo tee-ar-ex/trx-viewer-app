@@ -2,6 +2,9 @@ use trx_rs::Format;
 
 use crate::app::state::{FormatlessDType, MergeStreamlineRowState, MergeStreamlinesDialogState};
 
+const PATH_LABEL_WIDTH: f32 = 210.0;
+const GROUP_NAME_WIDTH: f32 = 130.0;
+
 pub struct MergeStreamlinesDialogAction {
     pub merge_requested: bool,
 }
@@ -32,11 +35,11 @@ pub fn show_merge_streamlines_dialog(
             ui.separator();
 
             ui.horizontal(|ui| {
-                ui.strong("Streamline File");
-                ui.add_space(170.0);
-                ui.strong("Reference NIfTI");
-                ui.add_space(110.0);
-                ui.strong("Group name");
+                ui.add_sized([PATH_LABEL_WIDTH, 20.0], egui::Label::new(egui::RichText::new("Streamline File").strong()));
+                ui.add_space(ui.spacing().item_spacing.x + 64.0);
+                ui.add_sized([PATH_LABEL_WIDTH, 20.0], egui::Label::new(egui::RichText::new("Reference NIfTI").strong()));
+                ui.add_space(ui.spacing().item_spacing.x + 108.0);
+                ui.add_sized([GROUP_NAME_WIDTH, 20.0], egui::Label::new(egui::RichText::new("Group name").strong()));
             });
 
             let mut remove_idx = None;
@@ -46,12 +49,7 @@ pub fn show_merge_streamlines_dialog(
             let row_count = state.rows.len();
             for (idx, row) in state.rows.iter_mut().enumerate() {
                 ui.horizontal(|ui| {
-                    let source_label = row
-                        .source_path
-                        .as_ref()
-                        .map(|path| path.display().to_string())
-                        .unwrap_or_else(|| "Select streamline file".to_string());
-                    ui.monospace(source_label);
+                    show_compact_path_label(ui, row.source_path.as_deref(), "Select streamline file");
                     if ui.button("Browse...").clicked()
                         && let Some(path) = rfd::FileDialog::new()
                             .add_filter("Streamline files", &["trx", "tck", "vtk", "tt", "gz"])
@@ -62,12 +60,7 @@ pub fn show_merge_streamlines_dialog(
                         state.error_msg = None;
                     }
 
-                    let reference_label = row
-                        .reference_path
-                        .as_ref()
-                        .map(|path| path.display().to_string())
-                        .unwrap_or_else(|| "Optional reference".to_string());
-                    ui.monospace(reference_label);
+                    show_compact_path_label(ui, row.reference_path.as_deref(), "Optional reference");
                     if ui.button("Ref...").clicked()
                         && let Some(path) = rfd::FileDialog::new()
                             .add_filter("NIfTI files", &["nii", "nii.gz", "gz"])
@@ -83,7 +76,7 @@ pub fn show_merge_streamlines_dialog(
                     }
 
                     ui.add_sized(
-                        [130.0, 20.0],
+                        [GROUP_NAME_WIDTH, 20.0],
                         egui::TextEdit::singleline(&mut row.group_name).hint_text("Optional"),
                     );
 
@@ -142,12 +135,7 @@ pub fn show_merge_streamlines_dialog(
             ui.separator();
             ui.horizontal(|ui| {
                 ui.label("Output TRX:");
-                let output_label = state
-                    .output_path
-                    .as_ref()
-                    .map(|path| path.display().to_string())
-                    .unwrap_or_else(|| "Choose output path".to_string());
-                ui.monospace(output_label);
+                show_compact_path_label(ui, state.output_path.as_deref(), "Choose output path");
                 if ui.button("Browse...").clicked()
                     && let Some(path) = rfd::FileDialog::new()
                         .add_filter("TRX files", &["trx"])
@@ -230,4 +218,58 @@ fn format_summary(format: Format) -> &'static str {
         Format::Vtk => "VTK PolyData streamline input.",
         Format::TinyTrack => "DSI Studio Tiny Track input.",
     }
+}
+
+fn show_compact_path_label(ui: &mut egui::Ui, path: Option<&std::path::Path>, empty_label: &str) {
+    match path {
+        Some(path) => {
+            let file_name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or(empty_label);
+            let parent = path
+                .parent()
+                .map(shorten_path)
+                .unwrap_or_else(|| ".".to_string());
+
+            ui.allocate_ui_with_layout(
+                egui::vec2(PATH_LABEL_WIDTH, 34.0),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| {
+                    ui.set_max_width(PATH_LABEL_WIDTH);
+                    let response = ui
+                        .add(egui::Label::new(egui::RichText::new(file_name).monospace()).truncate())
+                        .on_hover_text(path.display().to_string());
+                    ui.small(parent).on_hover_text(path.display().to_string());
+                    response.context_menu(|ui| {
+                        ui.label(path.display().to_string());
+                    });
+                },
+            );
+        }
+        None => {
+            ui.add_sized(
+                [PATH_LABEL_WIDTH, 34.0],
+                egui::Label::new(egui::RichText::new(empty_label).monospace()).truncate(),
+            );
+        }
+    }
+}
+
+fn shorten_path(path: &std::path::Path) -> String {
+    let components = path
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+
+    if components.len() <= 3 {
+        return path.display().to_string();
+    }
+
+    format!(
+        ".../{}/{}/{}",
+        components[components.len() - 3],
+        components[components.len() - 2],
+        components[components.len() - 1]
+    )
 }

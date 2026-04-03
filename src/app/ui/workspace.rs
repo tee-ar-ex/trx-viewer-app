@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 use egui_tiles::{Behavior, Tree, UiResponse};
 
 use crate::app::workflow::{self, WorkflowGraphViewer, WorkflowSelection, WorkspacePane};
@@ -125,10 +127,12 @@ impl super::super::TrxViewerApp {
 
         let selected_nodes =
             egui_snarl::ui::get_selected_nodes(egui::Id::new("workflow_graph"), ui.ctx());
-        if let Some(node_id) = selected_nodes.first().copied() {
+        if let Some(node_id) = selected_nodes.last().copied() {
             self.workflow.selection = Some(WorkflowSelection::Node(
                 self.workflow.document.graph[node_id].uuid,
             ));
+        } else if matches!(self.workflow.selection, Some(WorkflowSelection::Node(_))) {
+            self.workflow.selection = None;
         }
     }
 
@@ -255,7 +259,14 @@ impl super::super::TrxViewerApp {
             }
             workflow::WorkflowNodeKind::GroupSelect { groups_csv } => {
                 ui.label("Comma-separated group names");
-                ui.text_edit_multiline(groups_csv);
+                let available_groups = self
+                    .workflow
+                    .runtime
+                    .node_state
+                    .get(&node_uuid)
+                    .map(|state| state.available_streamline_groups.as_slice())
+                    .unwrap_or(&[]);
+                show_group_select_editor(ui, groups_csv, available_groups);
             }
             workflow::WorkflowNodeKind::RandomSubset { limit, seed } => {
                 ui.add(egui::Slider::new(limit, 1..=1_000_000).text("Limit"));
@@ -613,6 +624,118 @@ impl super::super::TrxViewerApp {
                 self.viewport.view_2d.window_open = true;
             }
         });
+    }
+}
+
+fn show_group_select_editor(
+    ui: &mut egui::Ui,
+    groups_csv: &mut String,
+    available_groups: &[String],
+) {
+    let output = egui::TextEdit::singleline(groups_csv)
+        .hint_text("Type a group name")
+        .desired_width(f32::INFINITY)
+        .show(ui);
+    let response = output.response.clone();
+
+    if available_groups.is_empty() {
+        ui.small("Autocomplete appears when the input streamline data exposes group names.");
+        return;
+    }
+
+    ui.small(format!("{} groups available", available_groups.len()));
+
+    let selected = parse_group_csv(groups_csv);
+    let current_fragment = current_group_fragment(groups_csv);
+    let current_fragment_lower = current_fragment.to_ascii_lowercase();
+    let has_current_fragment = !current_fragment.is_empty();
+    let suggestion_state_id = response.id.with("group_select_suggestions");
+    let mut suggestions_open = ui
+        .ctx()
+        .data(|d| d.get_temp::<bool>(suggestion_state_id))
+        .unwrap_or(false);
+
+    if response.has_focus() {
+        suggestions_open = true;
+    }
+
+    let suggestions = available_groups
+        .iter()
+        .filter(|name| {
+            !selected.contains(name.as_str())
+                && (current_fragment_lower.is_empty()
+                    || name.to_ascii_lowercase().contains(&current_fragment_lower))
+        })
+        .take(8)
+        .cloned()
+        .collect::<Vec<_>>();
+
+    if suggestions.is_empty() {
+        ui.ctx().data_mut(|d| d.remove::<bool>(suggestion_state_id));
+        return;
+    }
+
+    if !suggestions_open {
+        return;
+    }
+
+    let mut picked_suggestion = false;
+    egui::Frame::group(ui.style()).show(ui, |ui| {
+        ui.set_max_height(140.0);
+        egui::ScrollArea::vertical()
+            .max_height(140.0)
+            .show(ui, |ui| {
+                for suggestion in suggestions {
+                    if ui.selectable_label(false, &suggestion).clicked() {
+                        replace_group_fragment(groups_csv, &suggestion);
+                        let mut state = output.state.clone();
+                        let cursor = egui::text::CCursor::new(groups_csv.chars().count());
+                        state
+                            .cursor
+                            .set_char_range(Some(egui::text::CCursorRange::two(cursor, cursor)));
+                        egui::TextEdit::store_state(ui.ctx(), response.id, state);
+                        response.request_focus();
+                        picked_suggestion = true;
+                        ui.ctx().request_repaint();
+                    }
+                }
+            });
+    });
+
+    if picked_suggestion {
+        ui.ctx().data_mut(|d| d.insert_temp(suggestion_state_id, false));
+        return;
+    }
+
+    let clicked_elsewhere = ui.input(|i| i.pointer.any_click()) && !response.hovered();
+    let keep_open = response.has_focus() || (!clicked_elsewhere && has_current_fragment);
+    ui.ctx()
+        .data_mut(|d| d.insert_temp(suggestion_state_id, keep_open));
+}
+
+fn parse_group_csv(groups_csv: &str) -> BTreeSet<&str> {
+    groups_csv
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .collect()
+}
+
+fn current_group_fragment(groups_csv: &str) -> &str {
+    groups_csv
+        .rsplit(',')
+        .next()
+        .map(str::trim)
+        .unwrap_or_default()
+}
+
+fn replace_group_fragment(groups_csv: &mut String, group_name: &str) {
+    let prefix_end = groups_csv.rfind(',').map(|idx| idx + 1).unwrap_or(0);
+    let prefix = groups_csv[..prefix_end].trim_end().to_string();
+    if prefix.is_empty() {
+        *groups_csv = format!("{group_name}, ");
+    } else {
+        *groups_csv = format!("{prefix} {group_name}, ");
     }
 }
 

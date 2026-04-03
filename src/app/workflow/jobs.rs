@@ -3,15 +3,12 @@ use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use trx_rs::{AnyTrxFile, ConversionOptions, DType, DataArray, Tractogram};
+use trx_rs::{AnyTrxFile, ConversionOptions};
 
-use crate::app::state::{LoadedParcellationSource, LoadedStreamlineSource};
 use crate::data::bundle_mesh::{BundleMesh, BundleMeshColorStrategy, build_bundle_mesh};
 use crate::data::loaded_files::{FileId, StreamlineBacking};
 use crate::data::orientation_field::{BoundaryContactField, StreamlineSet};
-use crate::data::trx_data::{
-    ColorMode, RenderStyle, TrxGpuData, build_tube_vertices_from_data, group_name_color,
-};
+use crate::data::trx_data::{RenderStyle, TrxGpuData, build_tube_vertices_from_data, group_name_color};
 use crate::renderer::glyph_renderer::GlyphResources;
 use crate::renderer::mesh_renderer::MeshResources;
 use crate::renderer::streamline_renderer::{AllStreamlineResources, StreamlineResources};
@@ -50,7 +47,6 @@ impl crate::app::TrxViewerApp {
                 WorkflowJobMessage::Finished {
                     node_uuid,
                     fingerprint,
-                    kind: _,
                     result,
                 } => {
                     self.workflow.jobs_in_flight.remove(&node_uuid);
@@ -69,10 +65,7 @@ impl crate::app::TrxViewerApp {
                                 self.workflow
                                     .execution_cache
                                     .derived_streamline_cache
-                                    .insert(
-                                        node_uuid,
-                                        CachedDerivedStreamline { fingerprint, flow },
-                                    );
+                                    .insert(node_uuid, CachedDerivedStreamline { flow });
                                 mark_expensive_success(record, fingerprint, summary);
                             }
                             WorkflowJobOutput::SurfaceQuery(flow) => {
@@ -81,7 +74,7 @@ impl crate::app::TrxViewerApp {
                                 self.workflow
                                     .execution_cache
                                     .surface_query_cache
-                                    .insert(node_uuid, CachedSurfaceQuery { fingerprint, flow });
+                                    .insert(node_uuid, CachedSurfaceQuery { flow });
                                 mark_expensive_success(record, fingerprint, summary);
                             }
                             WorkflowJobOutput::SurfaceMap(map) => {
@@ -92,10 +85,7 @@ impl crate::app::TrxViewerApp {
                                 self.workflow
                                     .execution_cache
                                     .surface_streamline_map_cache
-                                    .insert(
-                                        node_uuid,
-                                        CachedSurfaceStreamlineMap { fingerprint, map },
-                                    );
+                                    .insert(node_uuid, CachedSurfaceStreamlineMap { map });
                                 mark_expensive_success(record, fingerprint, summary);
                             }
                             WorkflowJobOutput::TubeGeometry { vertices, indices } => {
@@ -187,13 +177,11 @@ impl crate::app::TrxViewerApp {
             let _ = tx.send(WorkflowJobMessage::Started {
                 node_uuid,
                 fingerprint,
-                kind,
             });
             let result = run_workflow_job(payload);
             let _ = tx.send(WorkflowJobMessage::Finished {
                 node_uuid,
                 fingerprint,
-                kind,
                 result,
             });
         });

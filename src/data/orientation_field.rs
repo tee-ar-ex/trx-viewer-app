@@ -43,6 +43,7 @@ impl BoundaryGlyphColorMode {
     }
 }
 
+#[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub struct BoundaryGlyphParams {
     pub voxel_size_mm: f32,
@@ -464,6 +465,7 @@ impl BoundaryContactField {
         self.contact_counts[compact_index]
     }
 
+    #[cfg(test)]
     pub fn total_contacts(&self) -> u64 {
         self.contact_counts.iter().map(|&v| v as u64).sum()
     }

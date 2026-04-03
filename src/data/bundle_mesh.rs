@@ -18,6 +18,7 @@ pub struct BundleMesh {
     pub indices: Vec<u32>,
 }
 
+#[allow(dead_code)]
 #[derive(Clone, Copy)]
 pub enum BundleMeshColorStrategy {
     SampledRgb,

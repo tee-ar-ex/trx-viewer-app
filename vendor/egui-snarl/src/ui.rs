@@ -261,7 +261,7 @@ impl NodeLayout {
         }
     }
 
-    fn output_heights(self, state: &NodeState) -> Heights {
+    fn output_heights(self, state: &NodeState) -> Heights<'_> {
         let rows = state.output_heights().as_slice();
 
         let outer = match (self.kind, self.equal_pin_row_heights) {
@@ -1105,9 +1105,7 @@ where
             drag_released |= response.drag_released;
 
             nodes_bb = nodes_bb.union(response.final_rect);
-            if rect_selection_ended.is_some() {
-                node_rects.push((node_idx, response.final_rect));
-            }
+            node_rects.push((node_idx, response.final_rect));
         }
     }
 
@@ -1194,15 +1192,30 @@ where
         }
     }
 
+    if let Some(pos) = latest_pos
+        && pin_hovered.is_none()
+        && ui.input(|i| i.pointer.button_clicked(PointerButton::Primary))
+        && let Some((node, _)) = node_rects.iter().rfind(|(_, rect)| rect.contains(pos))
+    {
+        if modifiers.shift {
+            snarl_state.select_one_node(modifiers.command, *node);
+        } else if modifiers.command {
+            snarl_state.deselect_one_node(*node);
+        } else {
+            snarl_state.select_one_node(true, *node);
+        }
+        node_to_top = Some(*node);
+    }
+
     if let Some(select_rect) = rect_selection_ended {
-        let select_nodes = node_rects.into_iter().filter_map(|(id, rect)| {
+        let select_nodes = node_rects.iter().filter_map(|(id, rect)| {
             let select = if style.get_select_rect_contained() {
-                select_rect.contains_rect(rect)
+                select_rect.contains_rect(*rect)
             } else {
-                select_rect.intersects(rect)
+                select_rect.intersects(*rect)
             };
 
-            if select { Some(id) } else { None }
+            if select { Some(*id) } else { None }
         });
 
         if modifiers.command {

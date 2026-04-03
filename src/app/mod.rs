@@ -190,11 +190,6 @@ impl TrxViewerApp {
             });
     }
 
-    /// Returns true if any TRX file is loaded.
-    pub(crate) fn has_streamlines(&self) -> bool {
-        !self.scene.trx_files.is_empty()
-    }
-
     fn open_import_dialog(&mut self, path: Option<PathBuf>) {
         let detected = path
             .as_ref()

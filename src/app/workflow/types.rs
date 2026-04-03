@@ -1,5 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::hash::Hasher;
+use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -9,9 +8,7 @@ use egui_tiles::{Container, Linear, LinearDir, Tile, Tiles, Tree};
 
 use crate::data::bundle_mesh::BundleMesh;
 use crate::data::gifti_data::GiftiSurfaceData;
-use crate::data::loaded_files::{
-    FileId, LoadedNifti, LoadedTrx, StreamlineBacking, VolumeColormap,
-};
+use crate::data::loaded_files::{FileId, StreamlineBacking, VolumeColormap};
 use crate::data::orientation_field::{
     BoundaryContactField, BoundaryGlyphColorMode, BoundaryGlyphNormalization,
 };
@@ -263,6 +260,7 @@ pub struct NodeEvalState {
     pub execution: Option<WorkflowExecutionStatus>,
     pub fingerprint: Option<u64>,
     pub last_result_summary: Option<String>,
+    pub available_streamline_groups: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -327,19 +325,16 @@ impl Default for ExpensiveNodeRunRecord {
 
 #[derive(Clone)]
 pub struct CachedSurfaceQuery {
-    pub fingerprint: u64,
     pub flow: StreamlineFlow,
 }
 
 #[derive(Clone)]
 pub struct CachedDerivedStreamline {
-    pub fingerprint: u64,
     pub flow: StreamlineFlow,
 }
 
 #[derive(Clone)]
 pub struct CachedSurfaceStreamlineMap {
-    pub fingerprint: u64,
     pub map: SurfaceStreamlineMap,
 }
 
@@ -423,6 +418,7 @@ pub struct StreamlineDataset {
     pub backing: StreamlineBacking,
 }
 
+#[allow(dead_code)]
 #[derive(Clone)]
 pub struct ParcellationAsset {
     pub id: FileId,
@@ -469,6 +465,7 @@ pub struct BundleDrawPlan {
     pub outline_thickness: f32,
 }
 
+#[allow(dead_code)]
 #[derive(Clone)]
 pub struct BoundaryGlyphDrawPlan {
     pub node_uuid: WorkflowNodeUuid,
@@ -491,6 +488,7 @@ pub struct VolumeDrawPlan {
     pub window_width: f32,
 }
 
+#[allow(dead_code)]
 #[derive(Clone)]
 pub struct SurfaceDrawPlan {
     pub node_uuid: WorkflowNodeUuid,
@@ -603,6 +601,7 @@ impl Default for WorkflowRuntime {
     }
 }
 
+#[allow(dead_code)]
 #[derive(Clone)]
 pub struct SaveStreamlinePlan {
     pub node_uuid: WorkflowNodeUuid,
@@ -716,12 +715,10 @@ pub enum WorkflowJobMessage {
     Started {
         node_uuid: WorkflowNodeUuid,
         fingerprint: u64,
-        kind: WorkflowJobKind,
     },
     Finished {
         node_uuid: WorkflowNodeUuid,
         fingerprint: u64,
-        kind: WorkflowJobKind,
         result: Result<WorkflowJobOutput, String>,
     },
 }
@@ -779,18 +776,6 @@ impl Default for WorkflowProject {
 }
 
 impl WorkflowNodeKind {
-    pub fn is_expensive(&self) -> bool {
-        match self {
-            Self::SurfaceDepthQuery { .. }
-            | Self::SurfaceProjectionDensity { .. }
-            | Self::SurfaceProjectionMeanDps { .. }
-            | Self::BundleSurfaceBuild { .. }
-            | Self::BoundaryFieldBuild { .. } => true,
-            Self::StreamlineDisplay { render_style, .. } => *render_style == RenderStyle::Tubes,
-            _ => false,
-        }
-    }
-
     pub fn title(&self) -> &'static str {
         match self {
             Self::StreamlineSource { .. } => "Streamline Source",

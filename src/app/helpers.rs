@@ -1,6 +1,5 @@
 use std::path::Path;
 
-use crate::data::trx_data::ColorMode;
 use trx_rs::Format;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,23 +39,6 @@ pub(super) fn tri_axis_value(p: glam::Vec3, axis_index: usize) -> f32 {
         0 => p.z,
         1 => p.y,
         _ => p.x,
-    }
-}
-
-/// Returns `Some((min, max))` when the color mode is scalar and auto-range is off,
-/// otherwise `None` so `recolor` will auto-detect the range from the data.
-pub(super) fn scalar_range_opt(
-    mode: &ColorMode,
-    auto: bool,
-    min: f32,
-    max: f32,
-) -> Option<(f32, f32)> {
-    if auto {
-        return None;
-    }
-    match mode {
-        ColorMode::Dpv(_) | ColorMode::Dps(_) => Some((min, max)),
-        _ => None,
     }
 }
 
