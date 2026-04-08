@@ -68,21 +68,30 @@ jobs:
         run: |
           APP="target/release/TRX Viewer.app"
           MACOS_DIR="$APP/Contents/MacOS"
-          mkdir -p "$MACOS_DIR"
-          cp "target/release/trx-viewer-app" "$MACOS_DIR/TRX Viewer"
+          RESOURCES_DIR="$APP/Contents/Resources"
+          STAGING_DIR="target/release/dmg-root"
+          APP_VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)"
+          BUILD_VERSION="${GITHUB_RUN_NUMBER}"
 
-          # Write minimal Info.plist
-          cat > "$APP/Contents/Info.plist" <<'PLIST'
+          mkdir -p "$MACOS_DIR" "$RESOURCES_DIR" "$STAGING_DIR"
+          cp "target/release/trx-viewer-app" "$MACOS_DIR/TRX Viewer"
+          chmod +x "$MACOS_DIR/TRX Viewer"
+
+          # Write bundle metadata with valid macOS version fields.
+          cat > "$APP/Contents/Info.plist" <<PLIST
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
             "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
           <plist version="1.0">
           <dict>
             <key>CFBundleName</key><string>TRX Viewer</string>
+            <key>CFBundleDisplayName</key><string>TRX Viewer</string>
             <key>CFBundleIdentifier</key><string>com.trx-viewer.app</string>
-            <key>CFBundleVersion</key><string>${{ github.ref_name }}</string>
+            <key>CFBundleShortVersionString</key><string>${APP_VERSION}</string>
+            <key>CFBundleVersion</key><string>${BUILD_VERSION}</string>
             <key>CFBundleExecutable</key><string>TRX Viewer</string>
             <key>CFBundlePackageType</key><string>APPL</string>
+            <key>CFBundleIconFile</key><string>icon.icns</string>
             <key>LSMinimumSystemVersion</key><string>12.0</string>
             <key>NSHighResolutionCapable</key><true/>
           </dict>
@@ -91,14 +100,20 @@ jobs:
 
           # Copy icon if present
           if [ -f assets/icon.icns ]; then
-            mkdir -p "$APP/Contents/Resources"
-            cp assets/icon.icns "$APP/Contents/Resources/"
+            cp assets/icon.icns "$RESOURCES_DIR/"
           fi
+
+          # Sign the app bundle so Gatekeeper sees a sealed bundle instead of a raw executable dump.
+          codesign --force --deep --sign - "$APP"
+          codesign --verify --deep --strict --verbose=2 "$APP"
+
+          rm -rf "$STAGING_DIR"
+          ditto "$APP" "$STAGING_DIR/TRX Viewer.app"
 
           # Create .dmg
           hdiutil create \
             -volname "TRX Viewer" \
-            -srcfolder "$APP" \
+            -srcfolder "$STAGING_DIR" \
             -ov -format UDZO \
             "target/release/TRX-Viewer-macos.dmg"
 
