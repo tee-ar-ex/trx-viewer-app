@@ -23,13 +23,13 @@ pub fn show_import_dialog(
     let mut open = state.open;
     let mut close_after = false;
 
-    egui::Window::new("Import Tractogram")
+    egui::Window::new("Import Streamlines")
         .open(&mut open)
         .collapsible(false)
         .resizable(false)
         .show(ctx, |ui| {
             ui.set_min_width(480.0);
-            ui.label("Import a foreign tractogram format directly into the viewer.");
+            ui.label("Import a foreign streamline format directly into the viewer.");
             ui.separator();
 
             ui.horizontal(|ui| {
@@ -38,11 +38,11 @@ pub fn show_import_dialog(
                     .source_path
                     .as_ref()
                     .map(|path| path.display().to_string())
-                    .unwrap_or_else(|| "Select a tractogram file".to_string());
+                    .unwrap_or_else(|| "Select a streamline file".to_string());
                 ui.monospace(source_label);
                 if ui.button("Browse...").clicked()
                     && let Some(path) = rfd::FileDialog::new()
-                        .add_filter("Tractograms", &["tck", "vtk", "tt", "gz"])
+                        .add_filter("Streamline files", &["tck", "vtk", "tt", "gz"])
                         .pick_file()
                 {
                     state.source_path = Some(path.clone());
@@ -55,7 +55,7 @@ pub fn show_import_dialog(
             if let Some(format) = format {
                 ui.label(format_summary(format));
             } else if state.source_path.is_some() {
-                ui.colored_label(egui::Color32::YELLOW, "Unsupported or unrecognized tractogram format.");
+                ui.colored_label(egui::Color32::YELLOW, "Unsupported or unrecognized streamline format.");
             } else {
                 ui.label("Choose a `.tck`, `.tck.gz`, `.vtk`, or `.tt.gz` file.");
             }
@@ -134,7 +134,9 @@ fn format_summary(format: Format) -> &'static str {
     match format {
         Format::Tck => "MRtrix TCK import. Gzipped `.tck.gz` is supported.",
         Format::Vtk => "VTK PolyData streamline import.",
-        Format::TinyTrack => "DSI Studio Tiny Track import. Embedded TT metadata and groups will be preserved.",
+        Format::TinyTrack => {
+            "DSI Studio Tiny Track import. Embedded TT metadata and groups will be preserved."
+        }
         Format::Trx => "TRX files should be opened directly with File > Open TRX.",
     }
 }

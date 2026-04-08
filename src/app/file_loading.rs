@@ -2,23 +2,72 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use glam::Vec3;
-use trx_rs::ConversionOptions;
+use trx_rs::{
+    AnyTrxFile, ConcatenateOptions, ConversionOptions, DType, Format, concatenate_any_trx,
+    header_from_reference,
+};
 
 use crate::data::gifti_data::GiftiSurfaceData;
 use crate::data::loaded_files::{
-    BundleMeshColorMode, BundleMeshSource, LoadedNifti, LoadedTrx, VolumeColormap,
+    FileId, LoadedNifti, LoadedTrx, StreamlineBacking, VolumeColormap,
 };
 use crate::data::nifti_data::NiftiVolume;
-use crate::data::trx_data::{ColorMode, RenderStyle, TrxGpuData};
+use crate::data::parcellation_data::{ParcellationVolume, guess_label_table_path};
+use crate::data::trx_data::TrxGpuData;
 use crate::renderer::camera::{OrbitCamera, OrthoSliceCamera};
 use crate::renderer::glyph_renderer::GlyphResources;
 use crate::renderer::mesh_renderer::{MeshResources, SurfaceColormap};
 use crate::renderer::slice_renderer::{AllSliceResources, SliceAxis, SliceResources};
-use crate::renderer::streamline_renderer::{AllStreamlineResources, StreamlineResources};
 
-use super::state::{ImportDialogState, LoadedGiftiSurface, SurfaceProjectionMode, WorkerMessage};
+use super::state::{
+    ImportDialogState, LoadedGiftiSurface, LoadedParcellationSource, LoadedStreamlineSource,
+    MergeStreamlinesDialogState, WorkerMessage,
+};
+use super::workflow::{self, LoadedParcellation, ParcellationAsset, WorkflowAssetDocument};
 
 impl super::TrxViewerApp {
+    fn loaded_streamline_source_from_any(
+        any: AnyTrxFile,
+    ) -> Result<LoadedStreamlineSource, String> {
+        TrxGpuData::from_any_trx(&any)
+            .map(|data| LoadedStreamlineSource {
+                data,
+                backing: StreamlineBacking::Native(Arc::new(any)),
+            })
+            .map_err(|e| e.to_string())
+    }
+
+    fn allocate_file_id(&mut self, explicit_id: Option<FileId>) -> FileId {
+        if let Some(id) = explicit_id {
+            self.scene.next_file_id = self.scene.next_file_id.max(id + 1);
+            id
+        } else {
+            let id = self.scene.next_file_id;
+            self.scene.next_file_id += 1;
+            id
+        }
+    }
+
+    fn register_workflow_asset(
+        &mut self,
+        asset: WorkflowAssetDocument,
+        add_default_nodes: bool,
+        streamline_limit: Option<usize>,
+    ) {
+        self.workflow.document.assets.push(asset.clone());
+        if add_default_nodes {
+            let pos = workflow::suggest_asset_branch_origin(&self.workflow.document);
+            let branch = workflow::add_default_nodes_for_asset(
+                &mut self.workflow.document,
+                &asset,
+                pos,
+                streamline_limit,
+            );
+            self.workflow.selection = Some(branch.primary_selection);
+            self.workflow.graph_focus_request = Some(branch.bounds);
+        }
+    }
+
     pub(super) fn begin_load_trx(&mut self, path: PathBuf) {
         let job_id = self.next_job_id;
         self.next_job_id += 1;
@@ -27,9 +76,12 @@ impl super::TrxViewerApp {
             .file_name()
             .map(|n| format!("Loading {}", n.to_string_lossy()))
             .unwrap_or_else(|| "Loading TRX".to_string());
-        self.pending_file_loads.push(super::state::PendingFileLoad { job_id, label });
+        self.pending_file_loads
+            .push(super::state::PendingFileLoad { job_id, label });
         std::thread::spawn(move || {
-            let result = TrxGpuData::load(&path).map_err(|e| e.to_string());
+            let result = AnyTrxFile::load(&path)
+                .map_err(|e| e.to_string())
+                .and_then(Self::loaded_streamline_source_from_any);
             let _ = tx.send(WorkerMessage::TrxLoaded {
                 job_id,
                 path,
@@ -46,7 +98,8 @@ impl super::TrxViewerApp {
             .file_name()
             .map(|n| format!("Loading {}", n.to_string_lossy()))
             .unwrap_or_else(|| "Loading NIfTI".to_string());
-        self.pending_file_loads.push(super::state::PendingFileLoad { job_id, label });
+        self.pending_file_loads
+            .push(super::state::PendingFileLoad { job_id, label });
         std::thread::spawn(move || {
             let result = NiftiVolume::load(&path).map_err(|e| e.to_string());
             let _ = tx.send(WorkerMessage::NiftiLoaded {
@@ -65,7 +118,8 @@ impl super::TrxViewerApp {
             .file_name()
             .map(|n| format!("Loading {}", n.to_string_lossy()))
             .unwrap_or_else(|| "Loading GIFTI".to_string());
-        self.pending_file_loads.push(super::state::PendingFileLoad { job_id, label });
+        self.pending_file_loads
+            .push(super::state::PendingFileLoad { job_id, label });
         std::thread::spawn(move || {
             let result = GiftiSurfaceData::load(&path).map_err(|e| e.to_string());
             let _ = tx.send(WorkerMessage::GiftiLoaded {
@@ -76,7 +130,33 @@ impl super::TrxViewerApp {
         });
     }
 
-    pub(super) fn begin_import_tractogram(&mut self, state: &ImportDialogState) {
+    pub(super) fn begin_load_parcellation(&mut self, path: PathBuf) {
+        let job_id = self.next_job_id;
+        self.next_job_id += 1;
+        let tx = self.worker_tx.clone();
+        let label = path
+            .file_name()
+            .map(|n| format!("Loading {}", n.to_string_lossy()))
+            .unwrap_or_else(|| "Loading parcellation".to_string());
+        self.pending_file_loads
+            .push(super::state::PendingFileLoad { job_id, label });
+        std::thread::spawn(move || {
+            let label_table_path = guess_label_table_path(&path);
+            let result = ParcellationVolume::load(&path, label_table_path.as_deref())
+                .map(|data| LoadedParcellationSource {
+                    data,
+                    label_table_path,
+                })
+                .map_err(|err| err.to_string());
+            let _ = tx.send(WorkerMessage::ParcellationLoaded {
+                job_id,
+                path,
+                result,
+            });
+        });
+    }
+
+    pub(super) fn begin_import_streamlines(&mut self, state: &ImportDialogState) {
         let Some(path) = state.source_path.clone() else {
             return;
         };
@@ -86,17 +166,60 @@ impl super::TrxViewerApp {
         let label = path
             .file_name()
             .map(|n| format!("Importing {}", n.to_string_lossy()))
-            .unwrap_or_else(|| "Importing tractogram".to_string());
+            .unwrap_or_else(|| "Importing streamlines".to_string());
         self.pending_file_loads
             .push(super::state::PendingFileLoad { job_id, label });
         std::thread::spawn(move || {
             let result = match trx_rs::read_tractogram(&path, &ConversionOptions::default()) {
-                Ok(tractogram) => TrxGpuData::from_tractogram(&tractogram).map_err(|e| e.to_string()),
+                Ok(tractogram) => TrxGpuData::from_tractogram(&tractogram)
+                    .map(|data| LoadedStreamlineSource {
+                        data,
+                        backing: StreamlineBacking::Imported(Arc::new(tractogram)),
+                    })
+                    .map_err(|e| e.to_string()),
                 Err(err) => Err(err.to_string()),
             };
-            let _ = tx.send(WorkerMessage::ImportedTractogramLoaded {
+            let _ = tx.send(WorkerMessage::ImportedStreamlinesLoaded {
                 job_id,
                 path,
+                result,
+            });
+        });
+    }
+
+    pub(super) fn begin_merge_streamlines(&mut self, state: &MergeStreamlinesDialogState) {
+        let Some(output_path) = state.output_path.clone() else {
+            return;
+        };
+        let job_id = self.next_job_id;
+        self.next_job_id += 1;
+        let tx = self.worker_tx.clone();
+        let rows = state.rows.clone();
+        let options = ConcatenateOptions {
+            delete_dps: state.delete_dps,
+            delete_dpv: state.delete_dpv,
+            delete_groups: state.delete_groups,
+            positions_dtype: state.positions_dtype.map(DType::from),
+            input_group_names: state
+                .rows
+                .iter()
+                .map(|row| {
+                    let trimmed = row.group_name.trim();
+                    (!trimmed.is_empty()).then(|| trimmed.to_string())
+                })
+                .collect(),
+        };
+        let label = output_path
+            .file_name()
+            .map(|n| format!("Creating {}", n.to_string_lossy()))
+            .unwrap_or_else(|| "Creating merged streamlines".to_string());
+        self.pending_file_loads
+            .push(super::state::PendingFileLoad { job_id, label });
+        std::thread::spawn(move || {
+            let result = create_merged_streamline_source(&rows, &output_path, &options);
+            let _ = tx.send(WorkerMessage::MergedStreamlinesCreated {
+                job_id,
+                path: output_path,
                 result,
             });
         });
@@ -105,59 +228,64 @@ impl super::TrxViewerApp {
     pub(super) fn apply_loaded_trx(
         &mut self,
         path: PathBuf,
-        data: TrxGpuData,
+        source: LoadedStreamlineSource,
         rs: &egui_wgpu::RenderState,
     ) {
-        let is_first =
-            self.trx_files.is_empty() && self.nifti_files.is_empty() && self.gifti_surfaces.is_empty();
-        self.volume_center = data.center();
-        self.volume_extent = data.extent();
+        self.apply_loaded_trx_with_options(path, source, rs, None, true);
+    }
+
+    pub(super) fn apply_loaded_trx_with_options(
+        &mut self,
+        path: PathBuf,
+        source: LoadedStreamlineSource,
+        rs: &egui_wgpu::RenderState,
+        explicit_id: Option<FileId>,
+        register_workflow_asset: bool,
+    ) {
+        let LoadedStreamlineSource { data, backing } = source;
+        let imported = matches!(backing, StreamlineBacking::Imported(_));
+        let is_first = self.scene.trx_files.is_empty()
+            && self.scene.nifti_files.is_empty()
+            && self.scene.gifti_surfaces.is_empty();
+        self.viewport.volume_center = data.center();
+        self.viewport.volume_extent = data.extent();
         if is_first {
-            self.camera_3d = OrbitCamera::new(self.volume_center, self.volume_extent * 0.8);
+            self.viewport.camera_3d = OrbitCamera::new(
+                self.viewport.volume_center,
+                self.viewport.volume_extent * 0.8,
+            );
             self.reset_slice_cameras();
         }
 
-        let resources = StreamlineResources::new(&rs.device, rs.target_format, &data);
         let data = Arc::new(data);
 
-        let id = self.next_file_id;
-        self.next_file_id += 1;
+        let id = self.allocate_file_id(explicit_id);
 
         {
             let mut renderer = rs.renderer.write();
-            if let Some(all) = renderer
-                .callback_resources
-                .get_mut::<AllStreamlineResources>()
-            {
-                all.entries.push((id, resources));
-            } else {
-                renderer.callback_resources.insert(AllStreamlineResources {
-                    entries: vec![(id, resources)],
-                });
-            }
             if renderer.callback_resources.get::<MeshResources>().is_none() {
                 let mr = MeshResources::new(&rs.device, rs.target_format);
                 renderer.callback_resources.insert(mr);
             }
-            if renderer.callback_resources.get::<GlyphResources>().is_none() {
+            if renderer
+                .callback_resources
+                .get::<GlyphResources>()
+                .is_none()
+            {
                 let gr = GlyphResources::new(&rs.device, rs.target_format);
                 renderer.callback_resources.insert(gr);
             }
         }
 
         if is_first {
-            self.slice_world_offsets = [
-                self.volume_center.z,
-                self.volume_center.y,
-                self.volume_center.x,
+            self.viewport.slice_world_offsets = [
+                self.viewport.volume_center.z,
+                self.viewport.volume_center.y,
+                self.viewport.volume_center.x,
             ];
         }
 
         let max_streamlines = data.nb_streamlines.min(30_000);
-        let streamline_order: Vec<u32> = (0..data.nb_streamlines as u32).collect();
-        let group_visible = vec![true; data.groups.len()];
-        let needs_index_update = data.nb_streamlines > max_streamlines;
-
         let name = path
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
@@ -166,51 +294,22 @@ impl super::TrxViewerApp {
         let trx = LoadedTrx {
             id,
             name,
-            path,
+            path: path.clone(),
             data,
-            visible: true,
-            color_mode: ColorMode::DirectionRgb,
-            render_style: RenderStyle::Flat,
-            tube_radius: 0.4,
-            tube_sides: 8,
-            group_visible,
-            max_streamlines,
-            use_random_subset: false,
-            streamline_order,
-            uniform_color: [1.0, 1.0, 1.0, 1.0],
-            scalar_auto_range: true,
-            scalar_range_min: 0.0,
-            scalar_range_max: 1.0,
-            colors_dirty: false,
-            indices_dirty: needs_index_update,
-            tube_mesh_pending: None,
-            tube_mesh_dirty_at: None,
-            tube_build_revision: 0,
-            index_build_pending: false,
-            slab_half_width: 5.0,
-            show_bundle_mesh: false,
-            bundle_mesh_source: BundleMeshSource::All,
-            bundle_mesh_color_mode: BundleMeshColorMode::StreamlineColor,
-            bundle_mesh_voxel_size: 2.0,
-            bundle_mesh_threshold: 3.0,
-            bundle_mesh_smooth: 0.2,
-            bundle_mesh_opacity: 0.5,
-            bundle_meshes_cpu: Vec::new(),
-            bundle_mesh_pending: None,
-            bundle_mesh_dirty_at: None,
-            sphere_query_result: None,
-            include_in_boundary_glyphs: false,
+            backing: Some(backing),
         };
 
-        self.trx_files.push(trx);
-        self.sphere_query_active = false;
-        self.surface_query_active = false;
-        self.surface_query_result = None;
-        self.surface_query_dirty = false;
-        self.surface_query_pending = false;
-        self.selection_revision = self.selection_revision.wrapping_add(1);
-        self.surface_projection_dirty = true;
+        self.scene.trx_files.push(trx);
+        if register_workflow_asset {
+            let asset = WorkflowAssetDocument::Streamlines {
+                id,
+                path: path.clone(),
+                imported,
+            };
+            self.register_workflow_asset(asset, true, Some(max_streamlines));
+        }
         self.error_msg = None;
+        self.status_msg = None;
     }
 
     pub(super) fn apply_loaded_nifti(
@@ -219,32 +318,61 @@ impl super::TrxViewerApp {
         vol: NiftiVolume,
         rs: &egui_wgpu::RenderState,
     ) {
-        let first_nifti = self.nifti_files.is_empty();
+        self.apply_loaded_nifti_with_options(path, vol, rs, None, true);
+    }
+
+    pub(super) fn apply_loaded_nifti_with_options(
+        &mut self,
+        path: PathBuf,
+        vol: NiftiVolume,
+        rs: &egui_wgpu::RenderState,
+        explicit_id: Option<FileId>,
+        register_workflow_asset: bool,
+    ) {
+        let first_nifti = self.scene.nifti_files.is_empty();
         let slice_indices = [vol.dims[2] / 2, vol.dims[1] / 2, vol.dims[0] / 2];
-        let is_first =
-            self.nifti_files.is_empty() && self.trx_files.is_empty() && self.gifti_surfaces.is_empty();
+        let is_first = self.scene.nifti_files.is_empty()
+            && self.scene.trx_files.is_empty()
+            && self.scene.gifti_surfaces.is_empty();
         if is_first {
-            self.volume_center = vol.voxel_to_world(Vec3::new(
+            self.viewport.volume_center = vol.voxel_to_world(Vec3::new(
                 vol.dims[0] as f32 / 2.0,
                 vol.dims[1] as f32 / 2.0,
                 vol.dims[2] as f32 / 2.0,
             ));
-            self.volume_extent = (vol.voxel_to_world(Vec3::new(
+            self.viewport.volume_extent = (vol.voxel_to_world(Vec3::new(
                 vol.dims[0] as f32,
                 vol.dims[1] as f32,
                 vol.dims[2] as f32,
             )) - vol.voxel_to_world(Vec3::ZERO))
             .length();
-            self.camera_3d = OrbitCamera::new(self.volume_center, self.volume_extent * 0.8);
+            self.viewport.camera_3d = OrbitCamera::new(
+                self.viewport.volume_center,
+                self.viewport.volume_extent * 0.8,
+            );
         }
 
         let slice_resources = SliceResources::new(&rs.device, &rs.queue, rs.target_format, &vol);
-        slice_resources.update_slice(&rs.queue, SliceAxis::Axial, self.slice_indices[0], &vol);
-        slice_resources.update_slice(&rs.queue, SliceAxis::Coronal, self.slice_indices[1], &vol);
-        slice_resources.update_slice(&rs.queue, SliceAxis::Sagittal, self.slice_indices[2], &vol);
+        slice_resources.update_slice(
+            &rs.queue,
+            SliceAxis::Axial,
+            self.viewport.slice_indices[0],
+            &vol,
+        );
+        slice_resources.update_slice(
+            &rs.queue,
+            SliceAxis::Coronal,
+            self.viewport.slice_indices[1],
+            &vol,
+        );
+        slice_resources.update_slice(
+            &rs.queue,
+            SliceAxis::Sagittal,
+            self.viewport.slice_indices[2],
+            &vol,
+        );
 
-        let id = self.next_file_id;
-        self.next_file_id += 1;
+        let id = self.allocate_file_id(explicit_id);
 
         {
             let mut renderer = rs.renderer.write();
@@ -261,24 +389,35 @@ impl super::TrxViewerApp {
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| "volume.nii".to_string());
-        self.nifti_files.push(LoadedNifti {
+        self.scene.nifti_files.push(LoadedNifti {
             id,
             name,
             volume: vol,
             colormap: VolumeColormap::Grayscale,
             opacity: 1.0,
-            z_order: self.nifti_files.len() as i32,
+            z_order: self.scene.nifti_files.len() as i32,
             window_center: 0.5,
             window_width: 1.0,
             visible: true,
         });
+        if register_workflow_asset {
+            self.register_workflow_asset(
+                WorkflowAssetDocument::Volume {
+                    id,
+                    path: path.clone(),
+                },
+                true,
+                None,
+            );
+        }
         if first_nifti {
-            self.slice_indices = slice_indices;
+            self.viewport.slice_indices = slice_indices;
             self.reset_slice_view();
         } else {
-            self.slices_dirty = false;
+            self.viewport.slices_dirty = false;
         }
         self.error_msg = None;
+        self.status_msg = None;
     }
 
     pub(super) fn apply_loaded_gifti_surface(
@@ -287,6 +426,22 @@ impl super::TrxViewerApp {
         surface: GiftiSurfaceData,
         rs: &egui_wgpu::RenderState,
     ) {
+        self.apply_loaded_gifti_surface_with_options(path, surface, rs, None, true);
+    }
+
+    pub(super) fn apply_loaded_gifti_surface_with_options(
+        &mut self,
+        path: PathBuf,
+        surface: GiftiSurfaceData,
+        rs: &egui_wgpu::RenderState,
+        explicit_id: Option<FileId>,
+        register_workflow_asset: bool,
+    ) {
+        let first_scene_asset = self.scene.trx_files.is_empty()
+            && self.scene.nifti_files.is_empty()
+            && self.scene.gifti_surfaces.is_empty()
+            && self.scene.parcellations.is_empty();
+        let id = self.allocate_file_id(explicit_id);
         let mut renderer = rs.renderer.write();
         if renderer.callback_resources.get::<MeshResources>().is_none() {
             renderer
@@ -298,68 +453,132 @@ impl super::TrxViewerApp {
             .get_mut::<MeshResources>()
             .expect("MeshResources inserted");
         let gpu_index = mesh_resources.add_surface(&rs.device, &surface);
+        let initial_surface_view = first_scene_asset.then(|| {
+            let center = (surface.bbox_min + surface.bbox_max) * 0.5;
+            let extent = (surface.bbox_max - surface.bbox_min).length().max(1.0);
+            (center, extent)
+        });
         let surface = Arc::new(surface);
 
-        let palette: &[[f32; 3]] = &[
-            [0.94, 0.35, 0.35],
-            [0.35, 0.8, 0.95],
-            [0.4, 0.92, 0.45],
-            [0.98, 0.75, 0.35],
-            [0.85, 0.45, 0.95],
-            [0.95, 0.55, 0.2],
-        ];
-        let color = palette[self.gifti_surfaces.len() % palette.len()];
+        let color = [0.72, 0.72, 0.72];
         let name = path
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| "surface.gii".to_string());
-        self.gifti_surfaces.push(LoadedGiftiSurface {
+        self.scene.gifti_surfaces.push(LoadedGiftiSurface {
+            id,
             name,
-            path,
+            path: path.clone(),
             data: surface,
             gpu_index,
             visible: true,
-            opacity: 0.7,
+            opacity: 1.0,
             color,
+            outline_color: color,
+            outline_thickness: 1.25,
             show_projection_map: false,
             map_opacity: 1.0,
             map_threshold: 0.0,
             surface_gloss: 0.45,
-            projection_mode: SurfaceProjectionMode::Density,
-            projection_dps: None,
-            projection_depth_mm: 2.0,
             projection_colormap: SurfaceColormap::Inferno,
             auto_range: true,
             range_min: 0.0,
             range_max: 1.0,
         });
-        self.surface_projection_dirty = true;
+        if register_workflow_asset {
+            self.register_workflow_asset(
+                WorkflowAssetDocument::Surface {
+                    id,
+                    path: path.clone(),
+                },
+                true,
+                None,
+            );
+        }
+        if let Some((center, extent)) = initial_surface_view {
+            self.viewport.volume_center = center;
+            self.viewport.volume_extent = extent;
+            self.viewport.camera_3d = OrbitCamera::new(center, extent * 0.8);
+            self.reset_slice_cameras();
+            self.viewport.slice_world_offsets = [center.z, center.y, center.x];
+        }
         self.error_msg = None;
+        self.status_msg = None;
+    }
+
+    pub(super) fn apply_loaded_parcellation(
+        &mut self,
+        path: PathBuf,
+        source: LoadedParcellationSource,
+    ) {
+        self.apply_loaded_parcellation_with_options(path, source, None, true);
+    }
+
+    pub(super) fn apply_loaded_parcellation_with_options(
+        &mut self,
+        path: PathBuf,
+        source: LoadedParcellationSource,
+        explicit_id: Option<FileId>,
+        register_workflow_asset: bool,
+    ) {
+        let id = self.allocate_file_id(explicit_id);
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "parcellation.nii.gz".to_string());
+        self.scene.parcellations.push(LoadedParcellation {
+            asset: ParcellationAsset {
+                id,
+                name,
+                path: path.clone(),
+                data: Arc::new(source.data),
+                label_table_path: source.label_table_path.clone(),
+                visible: true,
+            },
+        });
+        if register_workflow_asset {
+            self.register_workflow_asset(
+                WorkflowAssetDocument::Parcellation {
+                    id,
+                    path,
+                    label_table_path: source.label_table_path,
+                },
+                true,
+                None,
+            );
+        }
+        self.error_msg = None;
+        self.status_msg = None;
     }
 
     pub(super) fn reset_slice_cameras(&mut self) {
         let half_extents = self
+            .scene
             .nifti_files
             .first()
             .map(|n| n.volume.slice_half_extents())
-            .unwrap_or([self.volume_extent * 0.5; 3]);
-        self.slice_cameras = [
-            OrthoSliceCamera::new(SliceAxis::Axial, self.volume_center, half_extents[0] * 2.0),
+            .unwrap_or([self.viewport.volume_extent * 0.5; 3]);
+        self.viewport.slice_cameras = [
+            OrthoSliceCamera::new(
+                SliceAxis::Axial,
+                self.viewport.volume_center,
+                half_extents[0] * 2.0,
+            ),
             OrthoSliceCamera::new(
                 SliceAxis::Coronal,
-                self.volume_center,
+                self.viewport.volume_center,
                 half_extents[1] * 2.0,
             ),
             OrthoSliceCamera::new(
                 SliceAxis::Sagittal,
-                self.volume_center,
+                self.viewport.volume_center,
                 half_extents[2] * 2.0,
             ),
         ];
     }
 
     pub(crate) fn reset_slice_view(&mut self) {
-        let Some(nf) = self.nifti_files.first() else {
+        let Some(nf) = self.scene.nifti_files.first() else {
             return;
         };
         let vol = &nf.volume;
@@ -369,12 +588,86 @@ impl super::TrxViewerApp {
             vol.dims[2] as f32 / 2.0,
         ));
         let half_extents = vol.slice_half_extents();
-        self.slice_cameras = [
+        self.viewport.slice_cameras = [
             OrthoSliceCamera::new(SliceAxis::Axial, world_center, half_extents[0] * 2.0),
             OrthoSliceCamera::new(SliceAxis::Coronal, world_center, half_extents[1] * 2.0),
             OrthoSliceCamera::new(SliceAxis::Sagittal, world_center, half_extents[2] * 2.0),
         ];
-        self.slice_world_offsets = [world_center.z, world_center.y, world_center.x];
-        self.slices_dirty = true;
+        self.viewport.slice_world_offsets = [world_center.z, world_center.y, world_center.x];
+        self.viewport.slices_dirty = true;
     }
+
+    pub(crate) fn reset_slice_view_to_boundary_field(
+        &mut self,
+        field: &crate::data::orientation_field::BoundaryContactField,
+    ) {
+        let size = Vec3::new(
+            field.grid.dims[0] as f32,
+            field.grid.dims[1] as f32,
+            field.grid.dims[2] as f32,
+        ) * field.grid.voxel_size_mm;
+        let center = field.grid.origin_ras + 0.5 * size;
+        let axial_extent = size.x.max(size.y);
+        let coronal_extent = size.x.max(size.z);
+        let sagittal_extent = size.y.max(size.z);
+
+        self.viewport.slice_cameras = [
+            OrthoSliceCamera::new(SliceAxis::Axial, center, axial_extent),
+            OrthoSliceCamera::new(SliceAxis::Coronal, center, coronal_extent),
+            OrthoSliceCamera::new(SliceAxis::Sagittal, center, sagittal_extent),
+        ];
+        self.viewport.slice_world_offsets = [center.z, center.y, center.x];
+    }
+}
+
+fn create_merged_streamline_source(
+    rows: &[super::state::MergeStreamlineRowState],
+    output_path: &std::path::Path,
+    options: &ConcatenateOptions,
+) -> Result<LoadedStreamlineSource, String> {
+    let tempdir = tempfile::TempDir::new().map_err(|err| err.to_string())?;
+    let mut owned_inputs = Vec::new();
+    for (idx, row) in rows.iter().enumerate() {
+        let Some(path) = row.source_path.as_ref() else {
+            continue;
+        };
+        let format = row
+            .detected_format
+            .or_else(|| trx_rs::detect_format(path).ok())
+            .ok_or_else(|| format!("Unsupported streamline input: {}", path.display()))?;
+        let any = match format {
+            Format::Trx => AnyTrxFile::load(path).map_err(|err| err.to_string())?,
+            Format::Tck | Format::Vtk | Format::TinyTrack => {
+                let header = row
+                    .reference_path
+                    .as_deref()
+                    .map(header_from_reference)
+                    .transpose()
+                    .map_err(|err| err.to_string())?;
+                let tractogram = trx_rs::read_tractogram(
+                    path,
+                    &ConversionOptions {
+                        header,
+                        ..ConversionOptions::default()
+                    },
+                )
+                .map_err(|err| err.to_string())?;
+                let temp_path = tempdir.path().join(format!("merge_input_{idx}.trx"));
+                trx_rs::write_tractogram(&temp_path, &tractogram, &ConversionOptions::default())
+                    .map_err(|err| err.to_string())?;
+                AnyTrxFile::load(&temp_path).map_err(|err| err.to_string())?
+            }
+        };
+        owned_inputs.push(any);
+    }
+
+    if owned_inputs.len() < 2 {
+        return Err("Choose at least two supported streamline inputs.".to_string());
+    }
+
+    let refs: Vec<&AnyTrxFile> = owned_inputs.iter().collect();
+    let merged = concatenate_any_trx(&refs, options).map_err(|err| err.to_string())?;
+    merged.save(output_path).map_err(|err| err.to_string())?;
+    let loaded = AnyTrxFile::load(output_path).map_err(|err| err.to_string())?;
+    super::TrxViewerApp::loaded_streamline_source_from_any(loaded)
 }

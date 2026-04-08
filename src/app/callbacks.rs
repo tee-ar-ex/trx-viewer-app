@@ -1,13 +1,14 @@
+use super::state::SceneLightingParams;
 use crate::data::orientation_field::BoundaryGlyphColorMode;
-use crate::renderer::glyph_renderer::GlyphResources;
 use crate::data::trx_data::RenderStyle;
+use crate::renderer::glyph_renderer::GlyphResources;
 use crate::renderer::mesh_renderer::{MeshDrawStyle, MeshResources};
 use crate::renderer::slice_renderer::AllSliceResources;
 use crate::renderer::streamline_renderer::AllStreamlineResources;
-use super::state::SceneLightingParams;
 
 // ── Paint Callbacks ──
 
+#[derive(Clone)]
 pub(super) struct VolumeDrawInfo {
     pub file_id: usize,
     pub window_center: f32,
@@ -19,11 +20,13 @@ pub(super) struct VolumeDrawInfo {
 #[derive(Clone)]
 pub(super) struct StreamlineDrawInfo {
     pub file_id: usize,
+    pub visible: bool,
     pub render_style: RenderStyle,
     pub tube_radius: f32,
     pub slab_half_width: f32,
 }
 
+#[derive(Clone)]
 pub(super) struct BundleDrawInfo {
     pub file_id: usize,
     pub opacity: f32,
@@ -32,6 +35,7 @@ pub(super) struct BundleDrawInfo {
 pub(super) struct Scene3DCallback {
     pub(super) view_proj: glam::Mat4,
     pub(super) camera_pos: glam::Vec3,
+    pub(super) camera_dir: glam::Vec3,
     pub(super) streamline_draws: Vec<StreamlineDrawInfo>,
     pub(super) show_streamlines: bool,
     pub(super) volume_draws: Vec<VolumeDrawInfo>,
@@ -55,6 +59,9 @@ impl egui_wgpu::CallbackTrait for Scene3DCallback {
     ) -> Vec<wgpu::CommandBuffer> {
         if let Some(all) = callback_resources.get_mut::<AllStreamlineResources>() {
             for sd in &self.streamline_draws {
+                if !sd.visible {
+                    continue;
+                }
                 if let Some((_, res)) = all.entries.iter().find(|(id, _)| *id == sd.file_id) {
                     let aux = if sd.render_style == RenderStyle::DepthCue {
                         300.0
@@ -174,6 +181,9 @@ impl egui_wgpu::CallbackTrait for Scene3DCallback {
         if self.show_streamlines && !self.streamline_draws.is_empty() {
             if let Some(all) = callback_resources.get::<AllStreamlineResources>() {
                 for sd in &self.streamline_draws {
+                    if !sd.visible {
+                        continue;
+                    }
                     if let Some((_, sr)) = all.entries.iter().find(|(id, _)| *id == sd.file_id) {
                         render_pass.set_bind_group(0, &sr.bind_groups[0], &[]);
                         if sd.render_style == RenderStyle::Tubes {
@@ -204,11 +214,19 @@ impl egui_wgpu::CallbackTrait for Scene3DCallback {
 
         if let Some(mr) = callback_resources.get::<MeshResources>() {
             if !self.surface_draws.is_empty() {
-                mr.paint(render_pass, 0, &self.surface_draws);
+                mr.paint_opaque(render_pass, 0, &self.surface_draws);
             }
             if !self.bundle_draws.is_empty() {
-                let file_ids: Vec<usize> = self.bundle_draws.iter().map(|d| d.file_id).collect();
-                mr.paint_bundle(render_pass, &file_ids);
+                let bundle_draws: Vec<(usize, f32)> = self
+                    .bundle_draws
+                    .iter()
+                    .map(|draw| (draw.file_id, draw.opacity))
+                    .collect();
+                mr.paint_bundle_opaque(render_pass, &bundle_draws);
+                mr.paint_bundle_transparent(render_pass, &bundle_draws, self.camera_dir);
+            }
+            if !self.surface_draws.is_empty() {
+                mr.paint_transparent(render_pass, 0, &self.surface_draws, self.camera_dir);
             }
         }
         if self.show_boundary_glyphs {
@@ -262,6 +280,9 @@ impl egui_wgpu::CallbackTrait for SliceViewCallback {
         }
         if let Some(all) = callback_resources.get_mut::<AllStreamlineResources>() {
             for sd in &self.streamline_draws {
+                if !sd.visible {
+                    continue;
+                }
                 if let Some((_, res)) = all.entries.iter().find(|(id, _)| *id == sd.file_id) {
                     let slab_min = self.slab_min - sd.slab_half_width;
                     let slab_max = self.slab_max + sd.slab_half_width;
@@ -336,6 +357,9 @@ impl egui_wgpu::CallbackTrait for SliceViewCallback {
         if self.show_streamlines && !self.streamline_draws.is_empty() {
             if let Some(all) = callback_resources.get::<AllStreamlineResources>() {
                 for sd in &self.streamline_draws {
+                    if !sd.visible {
+                        continue;
+                    }
                     if let Some((_, sr)) = all.entries.iter().find(|(id, _)| *id == sd.file_id) {
                         render_pass.set_pipeline(&sr.slice_pipeline);
                         render_pass.set_bind_group(0, &sr.bind_groups[self.bind_group_index], &[]);

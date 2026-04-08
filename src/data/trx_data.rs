@@ -1,13 +1,13 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
-use std::path::Path;
-
 use crate::data::gifti_data::GiftiSurfaceData;
 use glam::Vec3;
-use trx_rs::{build_streamline_aabbs_from_slices, AnyTrxFile, DataArray, StreamlineAabb, Tractogram};
+use trx_rs::{
+    AnyTrxFile, DataArray, StreamlineAabb, Tractogram, build_streamline_aabbs_from_slices,
+};
 
 /// Rendering style for streamlines.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum RenderStyle {
     /// Plain colored lines.
     Flat = 0,
@@ -114,7 +114,7 @@ const TABLEAU_EXTENSION: [[f32; 3]; 2] = [
 
 /// Return the reference color for a well-known bundle group name, or `None` if
 /// the name is not recognised.  Colors are [R, G, B, A] linear floats in [0, 1].
-fn group_name_color(name: &str) -> Option<[f32; 4]> {
+pub(crate) fn group_name_color(name: &str) -> Option<[f32; 4]> {
     let t = |i: usize| -> [f32; 4] {
         let [r, g, b] = TABLEAU_20[i];
         [r, g, b, 1.0]
@@ -163,12 +163,6 @@ fn group_name_color(name: &str) -> Option<[f32; 4]> {
 }
 
 impl TrxGpuData {
-    /// Load a TRX file and produce GPU-ready data with direction-RGB coloring.
-    pub fn load(path: &Path) -> anyhow::Result<Self> {
-        let any = AnyTrxFile::load(path)?;
-        Self::from_any_trx(&any)
-    }
-
     pub fn from_tractogram(tractogram: &Tractogram) -> anyhow::Result<Self> {
         let positions = tractogram.positions().to_vec();
         let nb_vertices = positions.len();
@@ -198,7 +192,7 @@ impl TrxGpuData {
         ))
     }
 
-    fn from_any_trx(any: &AnyTrxFile) -> anyhow::Result<Self> {
+    pub fn from_any_trx(any: &AnyTrxFile) -> anyhow::Result<Self> {
         let positions = any.positions_f32();
         let nb_vertices = positions.len();
         let nb_streamlines = any.nb_streamlines();
@@ -271,101 +265,6 @@ impl TrxGpuData {
             ColorMode::Group => self.compute_group_colors(),
             ColorMode::Uniform(c) => vec![*c; self.nb_vertices],
         };
-    }
-
-    /// Compute the natural (robust) scalar range for the given color mode, if applicable.
-    pub fn scalar_range_for_mode(&self, mode: &ColorMode) -> Option<(f32, f32)> {
-        match mode {
-            ColorMode::Dpv(name) => self
-                .dpv_data
-                .iter()
-                .find(|(n, _)| n == name)
-                .map(|(_, data)| scalar_auto_range(data)),
-            ColorMode::Dps(name) => self
-                .dps_data
-                .iter()
-                .find(|(n, _)| n == name)
-                .map(|(_, data)| scalar_auto_range(data)),
-            _ => None,
-        }
-    }
-
-    /// Build index buffer applying all active filters: group visibility, max count,
-    /// ordering (for random subsetting), and optional sphere query.
-    pub fn build_index_buffer(
-        &self,
-        visible_groups: &[bool],
-        max_count: usize,
-        ordering: &[u32],
-        sphere_indices: Option<&HashSet<u32>>,
-        surface_indices: Option<&HashSet<u32>>,
-    ) -> Vec<u32> {
-        let selected = self.filtered_streamline_indices(
-            visible_groups,
-            max_count,
-            ordering,
-            sphere_indices,
-            surface_indices,
-        );
-
-        // Step 4: Build line-segment index pairs
-        let mut indices = Vec::with_capacity(selected.len() * 100); // rough estimate
-        for &si in &selected {
-            let s = si as usize;
-            if s + 1 < self.offsets.len() {
-                let start = self.offsets[s];
-                let end = self.offsets[s + 1];
-                for j in start..end.saturating_sub(1) {
-                    indices.push(j);
-                    indices.push(j + 1);
-                }
-            }
-        }
-        indices
-    }
-
-    /// Return the selected streamline indices after applying active filters.
-    pub fn filtered_streamline_indices(
-        &self,
-        visible_groups: &[bool],
-        max_count: usize,
-        ordering: &[u32],
-        sphere_indices: Option<&HashSet<u32>>,
-        surface_indices: Option<&HashSet<u32>>,
-    ) -> Vec<u32> {
-        // Step 1: Collect visible streamline indices
-        let visible_set: Vec<u32> = if self.groups.is_empty() {
-            (0..self.nb_streamlines as u32).collect()
-        } else {
-            let mut v = Vec::new();
-            for (i, (_, members)) in self.groups.iter().enumerate() {
-                if i < visible_groups.len() && !visible_groups[i] {
-                    continue;
-                }
-                v.extend_from_slice(members);
-            }
-            v
-        };
-
-        // Step 2: Spatial filter intersections
-        let filtered: Vec<u32> = visible_set
-            .into_iter()
-            .filter(|idx| sphere_indices.is_none_or(|set| set.contains(idx)))
-            .filter(|idx| surface_indices.is_none_or(|set| set.contains(idx)))
-            .collect();
-
-        // Step 3: Apply ordering and max count
-        if ordering.len() == self.nb_streamlines {
-            let filtered_set: HashSet<u32> = filtered.into_iter().collect();
-            ordering
-                .iter()
-                .copied()
-                .filter(|idx| filtered_set.contains(idx))
-                .take(max_count)
-                .collect()
-        } else {
-            filtered.into_iter().take(max_count).collect()
-        }
     }
 
     /// Query streamlines intersecting a sphere. Returns matching streamline indices.
@@ -586,14 +485,90 @@ impl TrxGpuData {
         (positions, colors, offsets)
     }
 
-    /// Estimate tube mesh buffer size before building, using original point counts.
-    pub fn estimate_tube_mesh_bytes(&self, selected_streamlines: &[u32], sides: u32) -> usize {
-        estimate_tube_mesh_bytes_from_offsets(
-            selected_streamlines.iter().map(|&si| {
-                (self.offsets[si as usize + 1] - self.offsets[si as usize]) as usize
-            }),
-            sides,
-        )
+    pub fn subset_streamlines(&self, selected_streamlines: &[u32]) -> Self {
+        let total_vertices: usize = selected_streamlines
+            .iter()
+            .map(|&si| (self.offsets[si as usize + 1] - self.offsets[si as usize]) as usize)
+            .sum();
+
+        let mut positions = Vec::with_capacity(total_vertices);
+        let mut tangents = Vec::with_capacity(total_vertices);
+        let mut colors = Vec::with_capacity(total_vertices);
+        let mut offsets = Vec::with_capacity(selected_streamlines.len() + 1);
+        let mut old_to_new = HashMap::new();
+        offsets.push(0);
+
+        for (new_index, &old_index_u32) in selected_streamlines.iter().enumerate() {
+            let old_index = old_index_u32 as usize;
+            let start = self.offsets[old_index] as usize;
+            let end = self.offsets[old_index + 1] as usize;
+            positions.extend_from_slice(&self.positions[start..end]);
+            tangents.extend_from_slice(&self.tangents[start..end]);
+            colors.extend_from_slice(&self.colors[start..end]);
+            offsets.push(positions.len() as u32);
+            old_to_new.insert(old_index_u32, new_index as u32);
+        }
+
+        let groups: Vec<(String, Vec<u32>)> = self
+            .groups
+            .iter()
+            .map(|(name, members)| {
+                let remapped = members
+                    .iter()
+                    .filter_map(|member| old_to_new.get(member).copied())
+                    .collect();
+                (name.clone(), remapped)
+            })
+            .collect();
+
+        let dps_data = self
+            .dps_data
+            .iter()
+            .map(|(name, data)| {
+                let subset = selected_streamlines
+                    .iter()
+                    .filter_map(|index| data.get(*index as usize).copied())
+                    .collect();
+                (name.clone(), subset)
+            })
+            .collect();
+
+        let dpv_data = self
+            .dpv_data
+            .iter()
+            .map(|(name, data)| {
+                let mut subset = Vec::with_capacity(total_vertices);
+                for &streamline_index in selected_streamlines {
+                    let start = self.offsets[streamline_index as usize] as usize;
+                    let end = self.offsets[streamline_index as usize + 1] as usize;
+                    subset.extend_from_slice(&data[start..end]);
+                }
+                (name.clone(), subset)
+            })
+            .collect();
+
+        let (bbox_min, bbox_max) = compute_bounding_box(&positions);
+        let all_indices = build_line_indices(&offsets);
+        let aabbs = build_streamline_aabbs_from_slices(&positions, &offsets);
+
+        Self {
+            positions,
+            offsets,
+            bbox_min,
+            bbox_max,
+            nb_streamlines: selected_streamlines.len(),
+            nb_vertices: total_vertices,
+            dpv_names: self.dpv_names.clone(),
+            dps_names: self.dps_names.clone(),
+            groups,
+            group_colors: self.group_colors.clone(),
+            dpv_data,
+            dps_data,
+            tangents,
+            colors,
+            all_indices,
+            aabbs,
+        }
     }
 
     pub fn center(&self) -> Vec3 {
@@ -669,9 +644,24 @@ fn compute_bounding_box(positions: &[[f32; 3]]) -> (Vec3, Vec3) {
 
 fn extract_group_color_from_any(trx: &AnyTrxFile, group: &str) -> Option<[f32; 4]> {
     trx.with_typed(
-        |inner| inner.dpg::<u8>(group, "color").ok().and_then(color_view_to_rgba),
-        |inner| inner.dpg::<u8>(group, "color").ok().and_then(color_view_to_rgba),
-        |inner| inner.dpg::<u8>(group, "color").ok().and_then(color_view_to_rgba),
+        |inner| {
+            inner
+                .dpg::<u8>(group, "color")
+                .ok()
+                .and_then(color_view_to_rgba)
+        },
+        |inner| {
+            inner
+                .dpg::<u8>(group, "color")
+                .ok()
+                .and_then(color_view_to_rgba)
+        },
+        |inner| {
+            inner
+                .dpg::<u8>(group, "color")
+                .ok()
+                .and_then(color_view_to_rgba)
+        },
     )
 }
 
@@ -899,32 +889,6 @@ pub fn build_tube_vertices_from_data(
     (vertices, indices)
 }
 
-pub fn estimate_tube_mesh_bytes_from_offsets<I>(point_counts: I, sides: u32) -> usize
-where
-    I: IntoIterator<Item = usize>,
-{
-    let sides = sides.max(3) as usize;
-    let mut vertices = 0usize;
-    let mut indices = 0usize;
-
-    for point_count in point_counts {
-        if point_count < 2 {
-            continue;
-        }
-        vertices = vertices.saturating_add(point_count.saturating_mul(sides).saturating_add(2));
-        indices = indices.saturating_add(
-            (point_count - 1)
-                .saturating_mul(sides)
-                .saturating_mul(6)
-                .saturating_add(6usize.saturating_mul(sides)),
-        );
-    }
-
-    vertices
-        .saturating_mul(std::mem::size_of::<TubeMeshVertex>())
-        .saturating_add(indices.saturating_mul(std::mem::size_of::<u32>()))
-}
-
 fn compute_streamline_tangents(points: &[TubePoint]) -> Vec<Vec3> {
     let mut tangents = Vec::with_capacity(points.len());
 
@@ -1074,7 +1038,9 @@ mod tests {
     #[test]
     fn from_tractogram_preserves_geometry_and_groups() {
         let mut tractogram = Tractogram::new();
-        tractogram.push_streamline(&[[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]).unwrap();
+        tractogram
+            .push_streamline(&[[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
+            .unwrap();
         tractogram.push_streamline(&[[7.0, 8.0, 9.0]]).unwrap();
         tractogram.insert_group("bundle_a", vec![0]);
 
@@ -1091,7 +1057,9 @@ mod tests {
     #[test]
     fn imported_dpg_color_overrides_name_palette() {
         let mut tractogram = Tractogram::new();
-        tractogram.push_streamline(&[[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]).unwrap();
+        tractogram
+            .push_streamline(&[[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
+            .unwrap();
         tractogram.insert_group("bundle_a", vec![0]);
         tractogram.insert_dpg(
             "bundle_a",
@@ -1101,14 +1069,22 @@ mod tests {
 
         let mut gpu = TrxGpuData::from_tractogram(&tractogram).unwrap();
         gpu.recolor(&ColorMode::Group, None);
-        assert_eq!(gpu.colors[0], [10.0 / 255.0, 20.0 / 255.0, 30.0 / 255.0, 1.0]);
-        assert_eq!(gpu.colors[1], [10.0 / 255.0, 20.0 / 255.0, 30.0 / 255.0, 1.0]);
+        assert_eq!(
+            gpu.colors[0],
+            [10.0 / 255.0, 20.0 / 255.0, 30.0 / 255.0, 1.0]
+        );
+        assert_eq!(
+            gpu.colors[1],
+            [10.0 / 255.0, 20.0 / 255.0, 30.0 / 255.0, 1.0]
+        );
     }
 
     #[test]
     fn group_name_palette_used_when_no_dpg_color_is_present() {
         let mut tractogram = Tractogram::new();
-        tractogram.push_streamline(&[[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]).unwrap();
+        tractogram
+            .push_streamline(&[[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
+            .unwrap();
         tractogram.insert_group("AF_L", vec![0]);
 
         let mut gpu = TrxGpuData::from_tractogram(&tractogram).unwrap();

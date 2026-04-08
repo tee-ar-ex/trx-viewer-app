@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use glam::Vec3;
 use wgpu::util::DeviceExt;
 
 use crate::app::AppSceneLightingParams as SceneLightingParams;
@@ -34,6 +35,7 @@ struct MeshVertex {
     normal: [f32; 3],
 }
 
+#[derive(Clone)]
 pub struct MeshDrawStyle {
     pub color: [f32; 4],
     pub scalar_min: f32,
@@ -45,7 +47,7 @@ pub struct MeshDrawStyle {
     pub map_threshold: f32,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum SurfaceColormap {
     BlueWhiteRed = 0,
     Viridis = 1,
@@ -69,16 +71,19 @@ struct BundleUniforms {
 struct BundleGpuSurface {
     vertex_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
+    transparent_index_buffers: [wgpu::Buffer; 6],
     num_indices: u32,
     uniform_buffer: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
 }
 
 pub struct MeshResources {
-    pub pipeline: wgpu::RenderPipeline,
+    pub opaque_pipeline: wgpu::RenderPipeline,
+    pub transparent_pipeline: wgpu::RenderPipeline,
     surfaces: Vec<GpuSurface>,
     // Bundle surfaces — keyed by file_id, one Vec per TRX file
-    pub bundle_pipeline: wgpu::RenderPipeline,
+    pub bundle_opaque_pipeline: wgpu::RenderPipeline,
+    pub bundle_transparent_pipeline: wgpu::RenderPipeline,
     bundle_surfaces: HashMap<usize, Vec<BundleGpuSurface>>,
 }
 
@@ -86,6 +91,7 @@ struct GpuSurface {
     vertex_buffer: wgpu::Buffer,
     scalar_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
+    transparent_index_buffers: [wgpu::Buffer; 6],
     num_indices: u32,
     uniform_buffers: [wgpu::Buffer; 4],
     bind_groups: [wgpu::BindGroup; 4],
@@ -118,67 +124,71 @@ impl MeshResources {
             push_constant_ranges: &[],
         });
 
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("mesh_pipeline"),
-            layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_main"),
-                buffers: &[
-                    wgpu::VertexBufferLayout {
-                        array_stride: std::mem::size_of::<MeshVertex>() as wgpu::BufferAddress,
-                        step_mode: wgpu::VertexStepMode::Vertex,
-                        attributes: &[
-                            wgpu::VertexAttribute {
+        let make_mesh_pipeline = |label: &'static str, depth_write_enabled: bool| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some("vs_main"),
+                    buffers: &[
+                        wgpu::VertexBufferLayout {
+                            array_stride: std::mem::size_of::<MeshVertex>() as wgpu::BufferAddress,
+                            step_mode: wgpu::VertexStepMode::Vertex,
+                            attributes: &[
+                                wgpu::VertexAttribute {
+                                    offset: 0,
+                                    shader_location: 0,
+                                    format: wgpu::VertexFormat::Float32x3,
+                                },
+                                wgpu::VertexAttribute {
+                                    offset: 12,
+                                    shader_location: 1,
+                                    format: wgpu::VertexFormat::Float32x3,
+                                },
+                            ],
+                        },
+                        wgpu::VertexBufferLayout {
+                            array_stride: std::mem::size_of::<f32>() as wgpu::BufferAddress,
+                            step_mode: wgpu::VertexStepMode::Vertex,
+                            attributes: &[wgpu::VertexAttribute {
                                 offset: 0,
-                                shader_location: 0,
-                                format: wgpu::VertexFormat::Float32x3,
-                            },
-                            wgpu::VertexAttribute {
-                                offset: 12,
-                                shader_location: 1,
-                                format: wgpu::VertexFormat::Float32x3,
-                            },
-                        ],
-                    },
-                    wgpu::VertexBufferLayout {
-                        array_stride: std::mem::size_of::<f32>() as wgpu::BufferAddress,
-                        step_mode: wgpu::VertexStepMode::Vertex,
-                        attributes: &[wgpu::VertexAttribute {
-                            offset: 0,
-                            shader_location: 2,
-                            format: wgpu::VertexFormat::Float32,
-                        }],
-                    },
-                ],
-                compilation_options: Default::default(),
-            },
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                cull_mode: Some(wgpu::Face::Back),
-                ..Default::default()
-            },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: wgpu::TextureFormat::Depth32Float,
-                depth_write_enabled: false,
-                depth_compare: wgpu::CompareFunction::LessEqual,
-                stencil: wgpu::StencilState::default(),
-                bias: wgpu::DepthBiasState::default(),
-            }),
-            multisample: wgpu::MultisampleState::default(),
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_main"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: target_format,
-                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: Default::default(),
-            }),
-            multiview: None,
-            cache: None,
-        });
+                                shader_location: 2,
+                                format: wgpu::VertexFormat::Float32,
+                            }],
+                        },
+                    ],
+                    compilation_options: Default::default(),
+                },
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    cull_mode: Some(wgpu::Face::Back),
+                    ..Default::default()
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: wgpu::TextureFormat::Depth32Float,
+                    depth_write_enabled,
+                    depth_compare: wgpu::CompareFunction::LessEqual,
+                    stencil: wgpu::StencilState::default(),
+                    bias: wgpu::DepthBiasState::default(),
+                }),
+                multisample: wgpu::MultisampleState::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some("fs_main"),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: target_format,
+                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: Default::default(),
+                }),
+                multiview: None,
+                cache: None,
+            })
+        };
+        let opaque_pipeline = make_mesh_pipeline("mesh_opaque_pipeline", true);
+        let transparent_pipeline = make_mesh_pipeline("mesh_transparent_pipeline", false);
 
         // ── Bundle mesh pipeline ──────────────────────────────────────────────
         let bundle_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -207,66 +217,73 @@ impl MeshResources {
         });
 
         let bundle_stride = std::mem::size_of::<BundleMeshVertex>() as wgpu::BufferAddress;
-        let bundle_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("bundle_mesh_pipeline"),
-            layout: Some(&bundle_pl_layout),
-            vertex: wgpu::VertexState {
-                module: &bundle_shader,
-                entry_point: Some("vs_main"),
-                buffers: &[wgpu::VertexBufferLayout {
-                    array_stride: bundle_stride,
-                    step_mode: wgpu::VertexStepMode::Vertex,
-                    attributes: &[
-                        wgpu::VertexAttribute {
-                            offset: 0,
-                            shader_location: 0,
-                            format: wgpu::VertexFormat::Float32x3,
-                        },
-                        wgpu::VertexAttribute {
-                            offset: 12,
-                            shader_location: 1,
-                            format: wgpu::VertexFormat::Float32x3,
-                        },
-                        wgpu::VertexAttribute {
-                            offset: 24,
-                            shader_location: 2,
-                            format: wgpu::VertexFormat::Float32x4,
-                        },
-                    ],
-                }],
-                compilation_options: Default::default(),
-            },
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                cull_mode: None, // two-sided (handled in shader)
-                ..Default::default()
-            },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: wgpu::TextureFormat::Depth32Float,
-                depth_write_enabled: true,
-                depth_compare: wgpu::CompareFunction::LessEqual,
-                stencil: wgpu::StencilState::default(),
-                bias: wgpu::DepthBiasState::default(),
-            }),
-            multisample: wgpu::MultisampleState::default(),
-            fragment: Some(wgpu::FragmentState {
-                module: &bundle_shader,
-                entry_point: Some("fs_main"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: target_format,
-                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: Default::default(),
-            }),
-            multiview: None,
-            cache: None,
-        });
+        let make_bundle_pipeline = |label: &'static str, depth_write_enabled: bool| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(&bundle_pl_layout),
+                vertex: wgpu::VertexState {
+                    module: &bundle_shader,
+                    entry_point: Some("vs_main"),
+                    buffers: &[wgpu::VertexBufferLayout {
+                        array_stride: bundle_stride,
+                        step_mode: wgpu::VertexStepMode::Vertex,
+                        attributes: &[
+                            wgpu::VertexAttribute {
+                                offset: 0,
+                                shader_location: 0,
+                                format: wgpu::VertexFormat::Float32x3,
+                            },
+                            wgpu::VertexAttribute {
+                                offset: 12,
+                                shader_location: 1,
+                                format: wgpu::VertexFormat::Float32x3,
+                            },
+                            wgpu::VertexAttribute {
+                                offset: 24,
+                                shader_location: 2,
+                                format: wgpu::VertexFormat::Float32x4,
+                            },
+                        ],
+                    }],
+                    compilation_options: Default::default(),
+                },
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    cull_mode: None, // two-sided (handled in shader)
+                    ..Default::default()
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: wgpu::TextureFormat::Depth32Float,
+                    depth_write_enabled,
+                    depth_compare: wgpu::CompareFunction::LessEqual,
+                    stencil: wgpu::StencilState::default(),
+                    bias: wgpu::DepthBiasState::default(),
+                }),
+                multisample: wgpu::MultisampleState::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module: &bundle_shader,
+                    entry_point: Some("fs_main"),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: target_format,
+                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: Default::default(),
+                }),
+                multiview: None,
+                cache: None,
+            })
+        };
+        let bundle_opaque_pipeline = make_bundle_pipeline("bundle_mesh_opaque_pipeline", true);
+        let bundle_transparent_pipeline =
+            make_bundle_pipeline("bundle_mesh_transparent_pipeline", false);
 
         Self {
-            pipeline,
+            opaque_pipeline,
+            transparent_pipeline,
             surfaces: Vec::new(),
-            bundle_pipeline,
+            bundle_opaque_pipeline,
+            bundle_transparent_pipeline,
             bundle_surfaces: HashMap::new(),
         }
     }
@@ -291,13 +308,22 @@ impl MeshResources {
             contents: bytemuck::cast_slice(&surface.indices),
             usage: wgpu::BufferUsages::INDEX,
         });
+        let transparent_index_orders =
+            build_transparent_index_orders(&surface.vertices, &surface.indices);
+        let transparent_index_buffers: [wgpu::Buffer; 6] = std::array::from_fn(|i| {
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some(&format!("gifti_surface_indices_sorted_{i}")),
+                contents: bytemuck::cast_slice(&transparent_index_orders[i]),
+                usage: wgpu::BufferUsages::INDEX,
+            })
+        });
         let scalar_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("gifti_surface_scalars"),
             contents: bytemuck::cast_slice(&vec![0.0f32; surface.vertices.len()]),
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
         });
 
-        let bind_group_layout = self.pipeline.get_bind_group_layout(0);
+        let bind_group_layout = self.opaque_pipeline.get_bind_group_layout(0);
         let default_uniforms = MeshUniforms {
             view_proj: glam::Mat4::IDENTITY.to_cols_array_2d(),
             color: [0.7, 0.7, 0.7, 1.0],
@@ -339,6 +365,7 @@ impl MeshResources {
             vertex_buffer,
             scalar_buffer,
             index_buffer,
+            transparent_index_buffers,
             num_indices: surface.indices.len() as u32,
             uniform_buffers,
             bind_groups,
@@ -395,16 +422,16 @@ impl MeshResources {
         }
     }
 
-    pub fn paint(
+    pub fn paint_opaque(
         &self,
         render_pass: &mut wgpu::RenderPass<'static>,
         viewport: usize,
         draw_calls: &[(usize, MeshDrawStyle)],
     ) {
-        render_pass.set_pipeline(&self.pipeline);
+        render_pass.set_pipeline(&self.opaque_pipeline);
         for (surface_index, style) in draw_calls {
             if let Some(surface) = self.surfaces.get(*surface_index) {
-                if style.color[3] <= 0.001 {
+                if style.color[3] <= 0.999 {
                     continue;
                 }
                 render_pass.set_bind_group(0, &surface.bind_groups[viewport], &[]);
@@ -412,6 +439,32 @@ impl MeshResources {
                 render_pass.set_vertex_buffer(1, surface.scalar_buffer.slice(..));
                 render_pass
                     .set_index_buffer(surface.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                render_pass.draw_indexed(0..surface.num_indices, 0, 0..1);
+            }
+        }
+    }
+
+    pub fn paint_transparent(
+        &self,
+        render_pass: &mut wgpu::RenderPass<'static>,
+        viewport: usize,
+        draw_calls: &[(usize, MeshDrawStyle)],
+        camera_dir: glam::Vec3,
+    ) {
+        render_pass.set_pipeline(&self.transparent_pipeline);
+        let transparent_order = transparent_view_bucket(camera_dir);
+        for (surface_index, style) in draw_calls {
+            if let Some(surface) = self.surfaces.get(*surface_index) {
+                if style.color[3] <= 0.001 || style.color[3] >= 0.999 {
+                    continue;
+                }
+                render_pass.set_bind_group(0, &surface.bind_groups[viewport], &[]);
+                render_pass.set_vertex_buffer(0, surface.vertex_buffer.slice(..));
+                render_pass.set_vertex_buffer(1, surface.scalar_buffer.slice(..));
+                render_pass.set_index_buffer(
+                    surface.transparent_index_buffers[transparent_order].slice(..),
+                    wgpu::IndexFormat::Uint32,
+                );
                 render_pass.draw_indexed(0..surface.num_indices, 0, 0..1);
             }
         }
@@ -435,6 +488,17 @@ impl MeshResources {
             contents: bytemuck::cast_slice(&mesh.indices),
             usage: wgpu::BufferUsages::INDEX,
         });
+        let bundle_positions: Vec<[f32; 3]> =
+            mesh.vertices.iter().map(|vertex| vertex.position).collect();
+        let transparent_index_orders =
+            build_transparent_index_orders(&bundle_positions, &mesh.indices);
+        let transparent_index_buffers: [wgpu::Buffer; 6] = std::array::from_fn(|i| {
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some(&format!("bundle_idx_sorted_{label}_{i}")),
+                contents: bytemuck::cast_slice(&transparent_index_orders[i]),
+                usage: wgpu::BufferUsages::INDEX,
+            })
+        });
         let default_uniforms = BundleUniforms {
             view_proj: glam::Mat4::IDENTITY.to_cols_array_2d(),
             camera_pos: [0.0; 3],
@@ -451,7 +515,7 @@ impl MeshResources {
             contents: bytemuck::bytes_of(&default_uniforms),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
-        let bgl = self.bundle_pipeline.get_bind_group_layout(0);
+        let bgl = self.bundle_opaque_pipeline.get_bind_group_layout(0);
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some(&format!("bundle_bg_{label}")),
             layout: &bgl,
@@ -463,6 +527,7 @@ impl MeshResources {
         BundleGpuSurface {
             vertex_buffer,
             index_buffer,
+            transparent_index_buffers,
             num_indices: mesh.indices.len() as u32,
             uniform_buffer,
             bind_group,
@@ -514,12 +579,19 @@ impl MeshResources {
     }
 
     /// Draw bundle surfaces only for the active file ids in the current frame.
-    pub fn paint_bundle(&self, render_pass: &mut wgpu::RenderPass<'static>, file_ids: &[usize]) {
-        if self.bundle_surfaces.is_empty() || file_ids.is_empty() {
+    pub fn paint_bundle_opaque(
+        &self,
+        render_pass: &mut wgpu::RenderPass<'static>,
+        draw_calls: &[(usize, f32)],
+    ) {
+        if self.bundle_surfaces.is_empty() || draw_calls.is_empty() {
             return;
         }
-        render_pass.set_pipeline(&self.bundle_pipeline);
-        for file_id in file_ids {
+        render_pass.set_pipeline(&self.bundle_opaque_pipeline);
+        for (file_id, opacity) in draw_calls {
+            if *opacity <= 0.999 {
+                continue;
+            }
             if let Some(surfaces) = self.bundle_surfaces.get(file_id) {
                 for bs in surfaces {
                     render_pass.set_bind_group(0, &bs.bind_group, &[]);
@@ -532,7 +604,126 @@ impl MeshResources {
         }
     }
 
+    pub fn paint_bundle_transparent(
+        &self,
+        render_pass: &mut wgpu::RenderPass<'static>,
+        draw_calls: &[(usize, f32)],
+        camera_dir: glam::Vec3,
+    ) {
+        if self.bundle_surfaces.is_empty() || draw_calls.is_empty() {
+            return;
+        }
+        render_pass.set_pipeline(&self.bundle_transparent_pipeline);
+        let transparent_order = transparent_view_bucket(camera_dir);
+        for (file_id, opacity) in draw_calls {
+            if *opacity <= 0.001 || *opacity >= 0.999 {
+                continue;
+            }
+            if let Some(surfaces) = self.bundle_surfaces.get(file_id) {
+                for bs in surfaces {
+                    render_pass.set_bind_group(0, &bs.bind_group, &[]);
+                    render_pass.set_vertex_buffer(0, bs.vertex_buffer.slice(..));
+                    render_pass.set_index_buffer(
+                        bs.transparent_index_buffers[transparent_order].slice(..),
+                        wgpu::IndexFormat::Uint32,
+                    );
+                    render_pass.draw_indexed(0..bs.num_indices, 0, 0..1);
+                }
+            }
+        }
+    }
+
     pub fn clear_bundle_mesh(&mut self, file_id: usize) {
         self.bundle_surfaces.remove(&file_id);
+    }
+}
+
+fn build_transparent_index_orders(vertices: &[[f32; 3]], indices: &[u32]) -> [Vec<u32>; 6] {
+    let triangle_count = indices.len() / 3;
+    let triangle_order_by_axis: [Vec<(f32, usize)>; 3] = std::array::from_fn(|axis| {
+        let mut order: Vec<(f32, usize)> = (0..triangle_count)
+            .map(|tri_index| {
+                let base = tri_index * 3;
+                let a = Vec3::from(vertices[indices[base] as usize]);
+                let b = Vec3::from(vertices[indices[base + 1] as usize]);
+                let c = Vec3::from(vertices[indices[base + 2] as usize]);
+                let centroid = (a + b + c) / 3.0;
+                (centroid[axis], tri_index)
+            })
+            .collect();
+        order.sort_by(|lhs, rhs| lhs.0.total_cmp(&rhs.0));
+        order
+    });
+
+    std::array::from_fn(|bucket| {
+        let axis = bucket % 3;
+        let descending = bucket >= 3;
+        let tri_indices: Box<dyn Iterator<Item = usize>> = if descending {
+            Box::new(
+                triangle_order_by_axis[axis]
+                    .iter()
+                    .rev()
+                    .map(|(_, tri_index)| *tri_index),
+            )
+        } else {
+            Box::new(
+                triangle_order_by_axis[axis]
+                    .iter()
+                    .map(|(_, tri_index)| *tri_index),
+            )
+        };
+
+        let mut sorted = Vec::with_capacity(indices.len());
+        for tri_index in tri_indices {
+            let base = tri_index * 3;
+            sorted.extend_from_slice(&indices[base..base + 3]);
+        }
+        sorted
+    })
+}
+
+fn transparent_view_bucket(view_dir: glam::Vec3) -> usize {
+    let abs = view_dir.abs();
+    if abs.x >= abs.y && abs.x >= abs.z {
+        if view_dir.x >= 0.0 { 3 } else { 0 }
+    } else if abs.y >= abs.z {
+        if view_dir.y >= 0.0 { 4 } else { 1 }
+    } else if view_dir.z >= 0.0 {
+        5
+    } else {
+        2
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{build_transparent_index_orders, transparent_view_bucket};
+    use glam::Vec3;
+
+    #[test]
+    fn transparent_bucket_uses_dominant_axis_and_sign() {
+        assert_eq!(transparent_view_bucket(Vec3::new(-1.0, 0.2, 0.1)), 0);
+        assert_eq!(transparent_view_bucket(Vec3::new(1.0, 0.2, 0.1)), 3);
+        assert_eq!(transparent_view_bucket(Vec3::new(0.2, -1.0, 0.1)), 1);
+        assert_eq!(transparent_view_bucket(Vec3::new(0.2, 1.0, 0.1)), 4);
+        assert_eq!(transparent_view_bucket(Vec3::new(0.2, 0.1, -1.0)), 2);
+        assert_eq!(transparent_view_bucket(Vec3::new(0.2, 0.1, 1.0)), 5);
+    }
+
+    #[test]
+    fn transparent_orders_sort_triangle_centroids_by_axis() {
+        let vertices = vec![
+            [-2.0, 0.0, 0.0],
+            [-1.0, 0.0, 0.0],
+            [-1.5, 1.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [2.0, 0.0, 0.0],
+            [1.5, 1.0, 0.0],
+        ];
+        let indices = vec![0, 1, 2, 3, 4, 5];
+        let orders = build_transparent_index_orders(&vertices, &indices);
+
+        assert_eq!(orders[0], vec![0, 1, 2, 3, 4, 5]);
+        assert_eq!(orders[3], vec![3, 4, 5, 0, 1, 2]);
     }
 }

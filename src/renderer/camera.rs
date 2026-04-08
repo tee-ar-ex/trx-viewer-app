@@ -42,6 +42,10 @@ impl OrbitCamera {
         self.center + Vec3::new(x, y, z)
     }
 
+    pub fn view_direction(&self) -> Vec3 {
+        (self.center - self.eye()).normalize_or_zero()
+    }
+
     pub fn view_matrix(&self) -> Mat4 {
         Mat4::look_at_rh(self.eye(), self.center, Vec3::Z)
     }
@@ -71,11 +75,6 @@ impl OrbitCamera {
         let scale = self.distance * 0.0015;
         self.center -= right * delta_x * scale;
         self.center += up * delta_y * scale;
-    }
-
-    pub fn handle_zoom_drag(&mut self, delta_x: f32, delta_y: f32) {
-        let zoom_delta = (-delta_x - delta_y) * 0.01;
-        self.handle_scroll(zoom_delta);
     }
 
     pub fn handle_scroll(&mut self, delta: f32) {
@@ -161,45 +160,26 @@ impl OrthoSliceCamera {
         rot * projection * view
     }
 
-    /// Convert a screen position to RAS+ world coordinates on the slice plane.
-    pub fn screen_to_world(
-        &self,
-        screen_pos: egui::Pos2,
-        rect: egui::Rect,
-        aspect: f32,
-        slice_position: f32,
-    ) -> Vec3 {
-        // Screen → NDC
-        let ndc_x = (screen_pos.x - rect.left()) / rect.width() * 2.0 - 1.0;
-        let ndc_y = 1.0 - (screen_pos.y - rect.top()) / rect.height() * 2.0; // flip Y
-
-        // Un-rotate NDC back to the pre-rotation camera frame
-        let cos_r = self.rotation.cos();
-        let sin_r = self.rotation.sin();
-        // Inverse of rotation by self.rotation is rotation by -self.rotation
-        let ux = cos_r * ndc_x + sin_r * ndc_y;
-        let uy = -sin_r * ndc_x + cos_r * ndc_y;
-        // NDC → in-plane world coordinates.
-        // Sign depends on which world axis maps to screen-right for each view:
-        //   Axial:    right = +X → wx = center[0] + ndc_x * hx
-        //   Coronal:  projection is flipped, so right = +X → wx = center[0] + ndc_x * hx
-        //   Sagittal: right = -Y → wx = center[0] - ndc_x * hx (center[0] = volume_center.y)
-        let hx = self.half_extent * aspect;
-        let hy = self.half_extent;
-        let wy = self.center[1] + uy * hy;
+    pub fn pan_screen(&mut self, delta_x: f32, delta_y: f32) {
+        let scale = self.half_extent * 0.0025;
         match self.axis {
             SliceAxis::Axial => {
-                let wx = self.center[0] + ux * hx;
-                Vec3::new(wx, wy, slice_position)
+                self.center[0] -= delta_x * scale;
+                self.center[1] += delta_y * scale;
             }
             SliceAxis::Coronal => {
-                let wx = self.center[0] + ux * hx;
-                Vec3::new(wx, slice_position, wy)
+                self.center[0] -= delta_x * scale;
+                self.center[1] += delta_y * scale;
             }
             SliceAxis::Sagittal => {
-                let wx = self.center[0] - ux * hx;
-                Vec3::new(slice_position, wx, wy)
+                self.center[0] += delta_x * scale;
+                self.center[1] += delta_y * scale;
             }
         }
+    }
+
+    pub fn zoom(&mut self, delta: f32) {
+        self.half_extent *= 1.0 - delta * 0.1;
+        self.half_extent = self.half_extent.max(0.5);
     }
 }

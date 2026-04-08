@@ -1,7 +1,7 @@
+use crate::data::orientation_field::BoundaryContactField;
 use glam::Vec3;
 use lin_alg::f32::Vec3 as LinVec3;
 use mcubes::{MarchingCubes, MeshSide};
-use crate::data::orientation_field::BoundaryContactField;
 
 /// Per-vertex data for a bundle surface mesh.
 #[repr(C)]
@@ -12,11 +12,13 @@ pub struct BundleMeshVertex {
     pub color: [f32; 4],
 }
 
+#[derive(Clone)]
 pub struct BundleMesh {
     pub vertices: Vec<BundleMeshVertex>,
     pub indices: Vec<u32>,
 }
 
+#[allow(dead_code)]
 #[derive(Clone, Copy)]
 pub enum BundleMeshColorStrategy {
     SampledRgb,
@@ -229,12 +231,10 @@ fn color_strategy_for_point(
                     let rgb = v.normalize().abs();
                     [rgb.x, rgb.y, rgb.z, 1.0]
                 } else {
-                    // Fall back to the local streamline-derived orientation when the
-                    // global boundary field has no support for this mesh vertex.
-                    principal_direction_rgb(grid.sample_tensor(gx, gy, gz))
+                    [0.7, 0.7, 0.7, 1.0]
                 }
             } else {
-                principal_direction_rgb(grid.sample_tensor(gx, gy, gz))
+                [0.7, 0.7, 0.7, 1.0]
             }
         }
         BundleMeshColorStrategy::Constant(color) => color,
@@ -316,17 +316,28 @@ fn gaussian_blur_3d(data: &[f32], nx: usize, ny: usize, nz: usize, sigma: f32) -
     dst
 }
 
-// ── Largest connected component ───────────────────────────────────────────────
+// ── Connected components ─────────────────────────────────────────────────────
 
-/// Retains only the triangles belonging to the largest connected component.
+#[derive(Clone)]
+struct TriangleComponent {
+    indices: Vec<u32>,
+    volume_mm3: f32,
+}
+
+/// Partition triangles into connected components.
 ///
-/// Connectivity is determined by shared vertex *positions* (quantized to 0.1 mm)
-/// rather than shared vertex indices, because `mcubes` may emit duplicate
-/// vertices for adjacent triangles with no shared indices.
-fn largest_component(vertices: &[BundleMeshVertex], indices: &[u32]) -> Vec<u32> {
+/// Connectivity is determined by shared vertex positions rather than shared
+/// indices, because `mcubes` may emit duplicate vertices for adjacent triangles.
+fn connected_components(vertices: &[BundleMeshVertex], indices: &[u32]) -> Vec<TriangleComponent> {
     let n_tris = indices.len() / 3;
-    if n_tris <= 1 {
-        return indices.to_vec();
+    if n_tris == 0 {
+        return Vec::new();
+    }
+    if n_tris == 1 {
+        return vec![TriangleComponent {
+            indices: indices.to_vec(),
+            volume_mm3: component_volume_mm3(vertices, indices),
+        }];
     }
 
     // Build quantized-position → triangle list.
@@ -347,14 +358,14 @@ fn largest_component(vertices: &[BundleMeshVertex], indices: &[u32]) -> Vec<u32>
     }
 
     let mut component: Vec<u32> = vec![u32::MAX; n_tris];
-    let mut comp_sizes: Vec<usize> = Vec::new();
+    let mut components = Vec::<TriangleComponent>::new();
     let mut queue: Vec<usize> = Vec::new();
 
     for start in 0..n_tris {
         if component[start] != u32::MAX {
             continue;
         }
-        let comp_id = comp_sizes.len() as u32;
+        let comp_id = components.len() as u32;
         queue.clear();
         queue.push(start);
         component[start] = comp_id;
@@ -380,45 +391,54 @@ fn largest_component(vertices: &[BundleMeshVertex], indices: &[u32]) -> Vec<u32>
                 }
             }
         }
-        comp_sizes.push(queue.len());
+        let component_indices = indices
+            .chunks(3)
+            .enumerate()
+            .filter(|(ti, _)| component[*ti] == comp_id)
+            .flat_map(|(_, tri)| tri.iter().copied())
+            .collect::<Vec<_>>();
+        let volume_mm3 = component_volume_mm3(vertices, &component_indices);
+        components.push(TriangleComponent {
+            indices: component_indices,
+            volume_mm3,
+        });
     }
 
-    let best = comp_sizes
-        .iter()
-        .enumerate()
-        .max_by_key(|&(_, &s)| s)
-        .map(|(i, _)| i as u32)
-        .unwrap_or(0);
-
-    indices
-        .chunks(3)
-        .zip(component.iter())
-        .filter(|(_, c)| **c == best)
-        .flat_map(|(tri, _)| tri.iter().copied())
-        .collect()
+    components
 }
 
-fn weld_and_recompute_normals(vertices: &mut [BundleMeshVertex], indices: &[u32]) {
-    if vertices.is_empty() || indices.len() < 3 {
-        return;
+fn component_volume_mm3(vertices: &[BundleMeshVertex], indices: &[u32]) -> f32 {
+    let mut signed_volume = 0.0f32;
+    for tri in indices.chunks_exact(3) {
+        let a = Vec3::from(vertices[tri[0] as usize].position);
+        let b = Vec3::from(vertices[tri[1] as usize].position);
+        let c = Vec3::from(vertices[tri[2] as usize].position);
+        signed_volume += a.dot(b.cross(c)) / 6.0;
     }
+    signed_volume.abs()
+}
 
-    const QUANT: f32 = 1e-4;
-    let quant_key = |p: [f32; 3]| -> (i32, i32, i32) {
-        (
-            (p[0] / QUANT).round() as i32,
-            (p[1] / QUANT).round() as i32,
-            (p[2] / QUANT).round() as i32,
-        )
-    };
+const WELD_QUANT: f32 = 1e-4;
+const TAUBIN_SMOOTHING_ITERS: usize = 4;
+const TAUBIN_LAMBDA: f32 = 0.33;
+const TAUBIN_MU: f32 = -0.34;
 
+fn quantized_position_key(p: [f32; 3]) -> (i32, i32, i32) {
+    (
+        (p[0] / WELD_QUANT).round() as i32,
+        (p[1] / WELD_QUANT).round() as i32,
+        (p[2] / WELD_QUANT).round() as i32,
+    )
+}
+
+fn welded_vertex_groups(vertices: &[BundleMeshVertex]) -> (Vec<usize>, Vec<Vec3>, Vec<u32>) {
     let mut group_lookup = std::collections::HashMap::<(i32, i32, i32), usize>::new();
     let mut vertex_group = vec![0usize; vertices.len()];
     let mut group_positions = Vec::<Vec3>::new();
     let mut group_counts = Vec::<u32>::new();
 
     for (vi, vertex) in vertices.iter().enumerate() {
-        let key = quant_key(vertex.position);
+        let key = quantized_position_key(vertex.position);
         let gid = if let Some(&gid) = group_lookup.get(&key) {
             gid
         } else {
@@ -436,6 +456,64 @@ fn weld_and_recompute_normals(vertices: &mut [BundleMeshVertex], indices: &[u32]
     for (gid, pos) in group_positions.iter_mut().enumerate() {
         *pos /= group_counts[gid].max(1) as f32;
     }
+
+    (vertex_group, group_positions, group_counts)
+}
+
+fn group_neighbors(vertex_group: &[usize], indices: &[u32], group_count: usize) -> Vec<Vec<usize>> {
+    let mut neighbors = vec![Vec::<usize>::new(); group_count];
+
+    let mut connect = |a: usize, b: usize| {
+        if a != b && !neighbors[a].contains(&b) {
+            neighbors[a].push(b);
+        }
+    };
+
+    for tri in indices.chunks_exact(3) {
+        let ga = vertex_group[tri[0] as usize];
+        let gb = vertex_group[tri[1] as usize];
+        let gc = vertex_group[tri[2] as usize];
+        connect(ga, gb);
+        connect(gb, ga);
+        connect(gb, gc);
+        connect(gc, gb);
+        connect(gc, ga);
+        connect(ga, gc);
+    }
+
+    neighbors
+}
+
+fn apply_taubin_smoothing(group_positions: &mut [Vec3], neighbors: &[Vec<usize>]) {
+    fn smooth_step(group_positions: &mut [Vec3], neighbors: &[Vec<usize>], factor: f32) {
+        let previous = group_positions.to_vec();
+        for (gid, position) in group_positions.iter_mut().enumerate() {
+            let adjacent = &neighbors[gid];
+            if adjacent.is_empty() {
+                continue;
+            }
+            let average = adjacent
+                .iter()
+                .fold(Vec3::ZERO, |acc, &neighbor| acc + previous[neighbor])
+                / adjacent.len() as f32;
+            *position = previous[gid] + factor * (average - previous[gid]);
+        }
+    }
+
+    for _ in 0..TAUBIN_SMOOTHING_ITERS {
+        smooth_step(group_positions, neighbors, TAUBIN_LAMBDA);
+        smooth_step(group_positions, neighbors, TAUBIN_MU);
+    }
+}
+
+fn weld_and_recompute_normals(vertices: &mut [BundleMeshVertex], indices: &[u32]) {
+    if vertices.is_empty() || indices.len() < 3 {
+        return;
+    }
+
+    let (vertex_group, mut group_positions, _) = welded_vertex_groups(vertices);
+    let neighbors = group_neighbors(&vertex_group, indices, group_positions.len());
+    apply_taubin_smoothing(&mut group_positions, &neighbors);
 
     for (vi, vertex) in vertices.iter_mut().enumerate() {
         vertex.position = group_positions[vertex_group[vi]].to_array();
@@ -482,6 +560,7 @@ pub fn build_bundle_mesh(
     voxel_size: f32,
     threshold: f32,
     smooth_sigma: f32,
+    min_component_volume_mm3: f32,
     color_strategy: BundleMeshColorStrategy,
     boundary_field: Option<&BoundaryContactField>,
 ) -> Option<BundleMesh> {
@@ -623,8 +702,13 @@ pub fn build_bundle_mesh(
 
     let raw_indices: Vec<u32> = mesh.indices.iter().map(|&i| i as u32).collect();
 
-    // ── 7. Keep only the largest connected component ─────────────────────────
-    let indices = largest_component(&vertices, &raw_indices);
+    // ── 7. Filter connected components by enclosed volume ───────────────────
+    let min_component_volume_mm3 = min_component_volume_mm3.max(0.0);
+    let indices = connected_components(&vertices, &raw_indices)
+        .into_iter()
+        .filter(|component| component.volume_mm3 >= min_component_volume_mm3)
+        .flat_map(|component| component.indices)
+        .collect::<Vec<_>>();
 
     if indices.is_empty() {
         return None;
@@ -633,4 +717,90 @@ pub fn build_bundle_mesh(
     weld_and_recompute_normals(&mut vertices, &indices);
 
     Some(BundleMesh { vertices, indices })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        BundleMeshVertex, TAUBIN_SMOOTHING_ITERS, apply_taubin_smoothing, component_volume_mm3,
+        connected_components, group_neighbors, welded_vertex_groups,
+    };
+    use glam::Vec3;
+
+    fn vertex(position: [f32; 3]) -> BundleMeshVertex {
+        BundleMeshVertex {
+            position,
+            normal: [0.0, 0.0, 1.0],
+            color: [0.5, 0.5, 0.5, 1.0],
+        }
+    }
+
+    #[test]
+    fn taubin_smoothing_leaves_isolated_vertices_unchanged() {
+        let vertices = vec![vertex([0.0, 0.0, 0.0]), vertex([1.0, 0.0, 0.0])];
+        let (vertex_group, mut group_positions, _) = welded_vertex_groups(&vertices);
+        let neighbors = group_neighbors(&vertex_group, &[], group_positions.len());
+        let before = group_positions.clone();
+        apply_taubin_smoothing(&mut group_positions, &neighbors);
+        assert_eq!(before, group_positions);
+    }
+
+    #[test]
+    fn taubin_smoothing_reduces_single_vertex_spike() {
+        let vertices = vec![
+            vertex([0.0, 0.0, 0.0]),
+            vertex([1.0, 0.0, 0.0]),
+            vertex([1.0, 1.0, 0.0]),
+            vertex([0.0, 1.0, 0.0]),
+            vertex([0.5, 0.5, 0.75]),
+        ];
+        let indices = vec![0, 1, 4, 1, 2, 4, 2, 3, 4, 3, 0, 4];
+        let (vertex_group, mut group_positions, _) = welded_vertex_groups(&vertices);
+        let neighbors = group_neighbors(&vertex_group, &indices, group_positions.len());
+        let original_height = group_positions[4].z;
+
+        apply_taubin_smoothing(&mut group_positions, &neighbors);
+
+        assert_eq!(TAUBIN_SMOOTHING_ITERS, 4);
+        assert!(group_positions[4].z < original_height);
+        let centroid = group_positions
+            .iter()
+            .copied()
+            .fold(Vec3::ZERO, |acc, p| acc + p)
+            / group_positions.len() as f32;
+        assert!(centroid.z > 0.0);
+    }
+
+    #[test]
+    fn connected_components_preserve_disconnected_meshes() {
+        let vertices = vec![
+            vertex([0.0, 0.0, 0.0]),
+            vertex([1.0, 0.0, 0.0]),
+            vertex([0.0, 1.0, 0.0]),
+            vertex([5.0, 5.0, 0.0]),
+            vertex([6.0, 5.0, 0.0]),
+            vertex([5.0, 6.0, 0.0]),
+        ];
+        let indices = vec![0, 1, 2, 3, 4, 5];
+        let components = connected_components(&vertices, &indices);
+        assert_eq!(components.len(), 2);
+        assert_eq!(components[0].indices.len(), 3);
+        assert_eq!(components[1].indices.len(), 3);
+    }
+
+    #[test]
+    fn component_volume_uses_absolute_signed_volume() {
+        let vertices = vec![
+            vertex([0.0, 0.0, 0.0]),
+            vertex([1.0, 0.0, 0.0]),
+            vertex([0.0, 1.0, 0.0]),
+            vertex([0.0, 0.0, 1.0]),
+        ];
+        let ccw = vec![0, 2, 1, 0, 1, 3, 0, 3, 2, 1, 2, 3];
+        let cw = vec![0, 1, 2, 0, 3, 1, 0, 2, 3, 1, 3, 2];
+        let ccw_volume = component_volume_mm3(&vertices, &ccw);
+        let cw_volume = component_volume_mm3(&vertices, &cw);
+        assert!(ccw_volume > 0.0);
+        assert!((ccw_volume - cw_volume).abs() < 1e-6);
+    }
 }

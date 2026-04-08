@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use glam::Vec3;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum BoundaryGlyphNormalization {
     RawCount,
     GlobalPeak,
@@ -28,7 +28,7 @@ impl BoundaryGlyphNormalization {
     ];
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum BoundaryGlyphColorMode {
     DirectionRgb,
     Monochrome,
@@ -43,6 +43,7 @@ impl BoundaryGlyphColorMode {
     }
 }
 
+#[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub struct BoundaryGlyphParams {
     pub voxel_size_mm: f32,
@@ -202,20 +203,21 @@ fn subdivide_sphere_once(
     indices: &mut Vec<u32>,
 ) {
     let mut midpoint_cache = HashMap::<(u32, u32), u32>::new();
-    let mut midpoint = |a: u32, b: u32, vertices: &mut Vec<[f32; 3]>, directions: &mut Vec<Vec3>| {
-        let key = if a < b { (a, b) } else { (b, a) };
-        if let Some(&idx) = midpoint_cache.get(&key) {
-            return idx;
-        }
-        let va = Vec3::from(vertices[a as usize]);
-        let vb = Vec3::from(vertices[b as usize]);
-        let vm = (va + vb).normalize_or_zero();
-        let idx = vertices.len() as u32;
-        vertices.push(vm.to_array());
-        directions.push(vm);
-        midpoint_cache.insert(key, idx);
-        idx
-    };
+    let mut midpoint =
+        |a: u32, b: u32, vertices: &mut Vec<[f32; 3]>, directions: &mut Vec<Vec3>| {
+            let key = if a < b { (a, b) } else { (b, a) };
+            if let Some(&idx) = midpoint_cache.get(&key) {
+                return idx;
+            }
+            let va = Vec3::from(vertices[a as usize]);
+            let vb = Vec3::from(vertices[b as usize]);
+            let vm = (va + vb).normalize_or_zero();
+            let idx = vertices.len() as u32;
+            vertices.push(vm.to_array());
+            directions.push(vm);
+            midpoint_cache.insert(key, idx);
+            idx
+        };
 
     let old = indices.clone();
     indices.clear();
@@ -226,12 +228,7 @@ fn subdivide_sphere_once(
         let ab = midpoint(a, b, vertices, directions);
         let bc = midpoint(b, c, vertices, directions);
         let ca = midpoint(c, a, vertices, directions);
-        indices.extend_from_slice(&[
-            a, ab, ca,
-            b, bc, ab,
-            c, ca, bc,
-            ab, bc, ca,
-        ]);
+        indices.extend_from_slice(&[a, ab, ca, b, bc, ab, c, ca, bc, ab, bc, ca]);
     }
 }
 
@@ -315,24 +312,24 @@ impl BoundaryContactField {
                     }
 
                     let flat0 = grid.flat_index(v0[0], v0[1], v0[2]);
-                        let flat1 = grid.flat_index(v1[0], v1[1], v1[2]);
+                    let flat1 = grid.flat_index(v1[0], v1[1], v1[2]);
 
-                        if segment_exit_from_voxel_box(p0, p1, v0, &grid).is_some() {
-                            let dir = (p1 - p0).normalize_or_zero();
-                            if dir.length_squared() > 0.0 {
-                                let compact = ensure_voxel(
-                                    flat0,
-                                    nbins,
-                                    &mut flat_to_compact,
-                                    &mut occupied_voxels,
-                                    &mut histograms,
-                                    &mut contact_counts,
-                                    &mut summary_vectors,
-                                    &mut summary_tensors,
-                                );
-                                accumulate_contact(
-                                    compact,
-                                    dir,
+                    if segment_exit_from_voxel_box(p0, p1, v0, &grid).is_some() {
+                        let dir = (p1 - p0).normalize_or_zero();
+                        if dir.length_squared() > 0.0 {
+                            let compact = ensure_voxel(
+                                flat0,
+                                nbins,
+                                &mut flat_to_compact,
+                                &mut occupied_voxels,
+                                &mut histograms,
+                                &mut contact_counts,
+                                &mut summary_vectors,
+                                &mut summary_tensors,
+                            );
+                            accumulate_contact(
+                                compact,
+                                dir,
                                 &sphere,
                                 nbins,
                                 &mut histograms,
@@ -343,22 +340,22 @@ impl BoundaryContactField {
                         }
                     }
 
-                        if segment_exit_from_voxel_box(p1, p0, v1, &grid).is_some() {
-                            let dir = (p1 - p0).normalize_or_zero();
-                            if dir.length_squared() > 0.0 {
-                                let compact = ensure_voxel(
-                                    flat1,
-                                    nbins,
-                                    &mut flat_to_compact,
-                                    &mut occupied_voxels,
-                                    &mut histograms,
-                                    &mut contact_counts,
-                                    &mut summary_vectors,
-                                    &mut summary_tensors,
-                                );
-                                accumulate_contact(
-                                    compact,
-                                    dir,
+                    if segment_exit_from_voxel_box(p1, p0, v1, &grid).is_some() {
+                        let dir = (p1 - p0).normalize_or_zero();
+                        if dir.length_squared() > 0.0 {
+                            let compact = ensure_voxel(
+                                flat1,
+                                nbins,
+                                &mut flat_to_compact,
+                                &mut occupied_voxels,
+                                &mut histograms,
+                                &mut contact_counts,
+                                &mut summary_vectors,
+                                &mut summary_tensors,
+                            );
+                            accumulate_contact(
+                                compact,
+                                dir,
                                 &sphere,
                                 nbins,
                                 &mut histograms,
@@ -468,6 +465,7 @@ impl BoundaryContactField {
         self.contact_counts[compact_index]
     }
 
+    #[cfg(test)]
     pub fn total_contacts(&self) -> u64 {
         self.contact_counts.iter().map(|&v| v as u64).sum()
     }
@@ -477,7 +475,7 @@ impl BoundaryContactField {
         let Some(voxel) = self.grid.point_to_voxel(world_pos) else {
             return Vec3::ZERO;
         };
-        let flat = self.grid.flat_index(voxel[0], voxel[1], voxel[2]);        
+        let flat = self.grid.flat_index(voxel[0], voxel[1], voxel[2]);
         if let Some(&idx) = self.compact_lookup.get(&flat) {
             return Vec3::from(self.summary_vectors[idx]);
         }
@@ -502,9 +500,7 @@ impl BoundaryContactField {
                     {
                         continue;
                     }
-                    let flat = self
-                        .grid
-                        .flat_index(nx as u32, ny as u32, nz as u32);
+                    let flat = self.grid.flat_index(nx as u32, ny as u32, nz as u32);
                     let Some(&idx) = self.compact_lookup.get(&flat) else {
                         continue;
                     };
@@ -614,7 +610,11 @@ fn segment_exit_from_voxel_box(
         if axis_dir.abs() <= 1e-8 {
             continue;
         }
-        let plane = if axis_dir > 0.0 { bmax[axis] } else { bmin[axis] };
+        let plane = if axis_dir > 0.0 {
+            bmax[axis]
+        } else {
+            bmin[axis]
+        };
         let t = (plane - start[axis]) / axis_dir;
         if !(1e-5..=1.0).contains(&t) {
             continue;
